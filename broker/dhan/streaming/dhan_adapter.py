@@ -334,7 +334,182 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             actual_depth=actual_depth,
             is_fallback=is_fallback
         )
-    
+
+    def subscribe_batch(self, symbols: list, mode: int = 2, depth_level: int = 5) -> Dict[str, Any]:
+        """
+        Subscribe to multiple symbols in a single batch call.
+        True parallel subscription - sends all instruments to broker at once.
+
+        Args:
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+            mode: Subscription mode - 1:LTP, 2:Quote, 3:Depth
+            depth_level: Market depth level (5, 20)
+
+        Returns:
+            dict: Response with status and list of subscription results
+        """
+        if not symbols:
+            return self._create_error_response("INVALID_PARAMETERS", "No symbols provided")
+
+        self.logger.info(f"Batch subscribing to {len(symbols)} symbols in mode {mode}")
+
+        # Group instruments by depth level
+        instruments_5depth = []
+        instruments_20depth = []
+        results = []
+
+        for symbol_info in symbols:
+            symbol = symbol_info.get('symbol', '')
+            exchange = symbol_info.get('exchange', '')
+
+            if not symbol or not exchange:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': 'Missing symbol or exchange'
+                })
+                continue
+
+            # Check for depth suffix
+            actual_symbol = symbol
+            use_20_depth = False
+
+            if symbol.endswith(':20'):
+                actual_symbol = symbol[:-3]
+                use_20_depth = True
+
+            # Look up token
+            token_info = SymbolMapper.get_token_from_symbol(actual_symbol, exchange)
+            if not token_info:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Token lookup failed for {actual_symbol}.{exchange}'
+                })
+                continue
+
+            token = token_info['token']
+            dhan_exchange = DhanExchangeMapper.get_dhan_exchange(exchange)
+
+            if not dhan_exchange:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Exchange {exchange} not supported'
+                })
+                continue
+
+            instrument = {
+                'ExchangeSegment': dhan_exchange,
+                'SecurityId': token
+            }
+
+            # Determine actual depth level
+            actual_depth = depth_level
+            if use_20_depth and exchange in ['NSE', 'NFO']:
+                actual_depth = 20
+            elif mode == 3 and not DhanCapabilityRegistry.is_depth_level_supported(exchange, depth_level):
+                actual_depth = DhanCapabilityRegistry.get_fallback_depth_level(exchange, depth_level)
+
+            # Store subscription info
+            correlation_id = f"{symbol}_{exchange}_{mode}_{actual_depth}"
+            sub_info = {
+                'symbol': symbol,
+                'actual_symbol': actual_symbol,
+                'exchange': exchange,
+                'dhan_exchange': dhan_exchange,
+                'token': token,
+                'mode': mode,
+                'depth_level': actual_depth,
+                'instrument': instrument
+            }
+
+            # Group by depth level
+            with self.lock:
+                if actual_depth == 20 and mode == 3:
+                    if len(self.subscriptions_20depth) < DhanCapabilityRegistry.MAX_SUBSCRIPTIONS_20_DEPTH:
+                        instruments_20depth.append((instrument, sub_info, correlation_id))
+                        self.subscriptions_20depth[correlation_id] = sub_info
+                        self.depth_20_timeouts[correlation_id] = time.time() + 30
+                        self.depth_20_data_received[correlation_id] = time.time()
+                    else:
+                        results.append({
+                            'symbol': symbol,
+                            'exchange': exchange,
+                            'status': 'error',
+                            'message': 'Max 20-depth subscriptions reached'
+                        })
+                        continue
+                else:
+                    if len(self.subscriptions_5depth) < DhanCapabilityRegistry.MAX_SUBSCRIPTIONS_5_DEPTH:
+                        instruments_5depth.append((instrument, sub_info, correlation_id))
+                        self.subscriptions_5depth[correlation_id] = sub_info
+                    else:
+                        results.append({
+                            'symbol': symbol,
+                            'exchange': exchange,
+                            'status': 'error',
+                            'message': 'Max subscriptions reached'
+                        })
+                        continue
+
+                # Store in base subscriptions
+                self.subscriptions[correlation_id] = {
+                    'symbol': symbol,
+                    'actual_symbol': actual_symbol,
+                    'exchange': exchange,
+                    'mode': mode,
+                    'depth_level': actual_depth,
+                    'is_20_depth': (actual_depth == 20 and mode == 3)
+                }
+
+            results.append({
+                'symbol': symbol,
+                'exchange': exchange,
+                'status': 'success',
+                'message': 'Subscription queued',
+                'actual_depth': actual_depth
+            })
+
+        # BATCH SUBSCRIBE - Send all instruments at once to each WebSocket connection
+        dhan_mode_map = {1: 'TICKER', 2: 'QUOTE', 3: 'FULL'}
+        dhan_mode = dhan_mode_map.get(mode, 'QUOTE')
+
+        # Subscribe 5-depth instruments in batch
+        if instruments_5depth and self.ws_client_5depth and self.ws_client_5depth.connected:
+            try:
+                batch_instruments = [inst[0] for inst in instruments_5depth]
+                self.ws_client_5depth.subscribe(batch_instruments, dhan_mode)
+                self.logger.info(f"Batch subscribed {len(batch_instruments)} instruments to 5-depth in {dhan_mode} mode")
+            except Exception as e:
+                self.logger.error(f"Error batch subscribing to 5-depth: {e}")
+                for _, sub_info, _ in instruments_5depth:
+                    for r in results:
+                        if r['symbol'] == sub_info['symbol'] and r['exchange'] == sub_info['exchange']:
+                            r['status'] = 'error'
+                            r['message'] = str(e)
+
+        # Subscribe 20-depth instruments in batch
+        if instruments_20depth and self.ws_client_20depth and self.ws_client_20depth.connected:
+            try:
+                batch_instruments = [inst[0] for inst in instruments_20depth]
+                self.ws_client_20depth.subscribe(batch_instruments, '20_DEPTH')
+                self.logger.info(f"Batch subscribed {len(batch_instruments)} instruments to 20-depth")
+            except Exception as e:
+                self.logger.error(f"Error batch subscribing to 20-depth: {e}")
+
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+
+        return {
+            'status': 'success' if success_count == len(results) else 'partial' if success_count > 0 else 'error',
+            'message': f'Batch subscription: {success_count}/{len(results)} successful',
+            'results': results,
+            'batch_mode': True
+        }
+
     def unsubscribe(self, symbol: str, exchange: str, mode: int = 2) -> Dict[str, Any]:
         """
         Unsubscribe from market data
@@ -397,7 +572,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     del self.subscriptions[correlation_id]
         
         if removed:
-            self.logger.info(f"Unubscribing to {symbol}.{exchange} in mode {mode}")
+            self.logger.info(f"Unsubscribing from {symbol}.{exchange} in mode {mode}")
             return self._create_success_response(
                 f"Unsubscribed from {symbol}.{exchange}",
                 symbol=symbol,
@@ -407,6 +582,138 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         else:
             return self._create_error_response("NOT_SUBSCRIBED",
                                               f"Not subscribed to {symbol}.{exchange}")
+
+    def unsubscribe_batch(self, symbols: list, mode: int = 2) -> Dict[str, Any]:
+        """
+        Unsubscribe from multiple symbols in a single batch call.
+        True parallel unsubscription - sends all instruments to broker at once.
+
+        Args:
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+            mode: Subscription mode - 1:LTP, 2:Quote, 3:Depth
+
+        Returns:
+            dict: Response with status and list of unsubscription results
+        """
+        if not symbols:
+            return self._create_error_response("INVALID_PARAMETERS", "No symbols provided")
+
+        self.logger.info(f"Batch unsubscribing from {len(symbols)} symbols in mode {mode}")
+
+        # Group instruments by depth level for batch unsubscription
+        instruments_5depth = []
+        instruments_20depth = []
+        results = []
+
+        for symbol_info in symbols:
+            symbol = symbol_info.get('symbol', '')
+            exchange = symbol_info.get('exchange', '')
+
+            if not symbol or not exchange:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': 'Missing symbol or exchange'
+                })
+                continue
+
+            # Check for depth suffix
+            actual_symbol = symbol
+            if symbol.endswith(':20'):
+                actual_symbol = symbol[:-3]
+
+            # Look up token
+            token_info = SymbolMapper.get_token_from_symbol(actual_symbol, exchange)
+            if not token_info:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Token lookup failed for {actual_symbol}.{exchange}'
+                })
+                continue
+
+            token = token_info['token']
+            dhan_exchange = DhanExchangeMapper.get_dhan_exchange(exchange)
+
+            if not dhan_exchange:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Exchange {exchange} not supported'
+                })
+                continue
+
+            instrument = {
+                'ExchangeSegment': dhan_exchange,
+                'SecurityId': token
+            }
+
+            # Find and remove subscriptions, group instruments by depth
+            removed = False
+            with self.lock:
+                for depth in [5, 20]:
+                    correlation_id = f"{symbol}_{exchange}_{mode}_{depth}"
+
+                    if correlation_id in self.subscriptions_5depth:
+                        del self.subscriptions_5depth[correlation_id]
+                        instruments_5depth.append(instrument)
+                        removed = True
+
+                    if correlation_id in self.subscriptions_20depth:
+                        del self.subscriptions_20depth[correlation_id]
+                        if correlation_id in self.depth_20_timeouts:
+                            del self.depth_20_timeouts[correlation_id]
+                        if correlation_id in self.depth_20_data_received:
+                            del self.depth_20_data_received[correlation_id]
+                        if correlation_id in self.depth_20_fallbacks:
+                            del self.depth_20_fallbacks[correlation_id]
+                        instruments_20depth.append(instrument)
+                        removed = True
+
+                    if correlation_id in self.subscriptions:
+                        del self.subscriptions[correlation_id]
+
+            if removed:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'success',
+                    'message': 'Unsubscription queued'
+                })
+            else:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Not subscribed to {symbol}.{exchange}'
+                })
+
+        # BATCH UNSUBSCRIBE - Send all instruments at once to each WebSocket connection
+        if instruments_5depth and self.ws_client_5depth:
+            try:
+                self.ws_client_5depth.unsubscribe(instruments_5depth)
+                self.logger.info(f"Batch unsubscribed {len(instruments_5depth)} instruments from 5-depth")
+            except Exception as e:
+                self.logger.error(f"Error batch unsubscribing from 5-depth: {e}")
+
+        if instruments_20depth and self.ws_client_20depth:
+            try:
+                self.ws_client_20depth.unsubscribe(instruments_20depth)
+                self.logger.info(f"Batch unsubscribed {len(instruments_20depth)} instruments from 20-depth")
+            except Exception as e:
+                self.logger.error(f"Error batch unsubscribing from 20-depth: {e}")
+
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+
+        return {
+            'status': 'success' if success_count == len(results) else 'partial' if success_count > 0 else 'error',
+            'message': f'Batch unsubscription: {success_count}/{len(results)} successful',
+            'results': results,
+            'batch_mode': True
+        }
 
     def unsubscribe_all(self) -> Dict[str, Any]:
         """
