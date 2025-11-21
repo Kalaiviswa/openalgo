@@ -268,20 +268,271 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
             exchange=exchange,
             mode=mode
         )
-    
+
+    def subscribe_batch(self, symbols: list, mode: int = 2, depth_level: int = 5) -> Dict[str, Any]:
+        """
+        Subscribe to multiple symbols in a single batch call.
+        Groups tokens by exchange type and sends one subscription per exchange.
+
+        Args:
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+            mode: Subscription mode - 1:LTP, 2:Quote, 3:Snap Quote
+            depth_level: Market depth level (5)
+
+        Returns:
+            dict: Response with status and list of subscription results
+        """
+        if not symbols:
+            return self._create_error_response("INVALID_PARAMETERS", "No symbols provided")
+
+        self.logger.info(f"Batch subscribing to {len(symbols)} symbols in mode {mode}")
+
+        # Group tokens by exchange type
+        exchange_tokens = {}  # {exchange_type: [token1, token2, ...]}
+        results = []
+
+        for symbol_info in symbols:
+            symbol = symbol_info.get('symbol', '')
+            exchange = symbol_info.get('exchange', '')
+
+            if not symbol or not exchange:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': 'Missing symbol or exchange'
+                })
+                continue
+
+            # Look up token
+            token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
+            if not token_info:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Token lookup failed for {symbol}.{exchange}'
+                })
+                continue
+
+            token = token_info['token']
+            brexchange = token_info['brexchange']
+            exchange_type = AngelExchangeMapper.get_exchange_type(brexchange)
+
+            if not exchange_type:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Exchange {exchange} not supported'
+                })
+                continue
+
+            # Group by exchange type
+            if exchange_type not in exchange_tokens:
+                exchange_tokens[exchange_type] = []
+            exchange_tokens[exchange_type].append(token)
+
+            # Store subscription info
+            correlation_id = f"{symbol}_{exchange}_{mode}"
+            with self.lock:
+                self.subscriptions[correlation_id] = {
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'brexchange': brexchange,
+                    'token': token,
+                    'mode': mode,
+                    'depth_level': depth_level,
+                    'actual_depth': depth_level,
+                    'is_fallback': False
+                }
+
+            results.append({
+                'symbol': symbol,
+                'exchange': exchange,
+                'status': 'success',
+                'message': 'Subscription queued',
+                'actual_depth': depth_level
+            })
+
+        # Build token_list for batch subscription
+        # Format: [{"exchangeType": 1, "tokens": ["10626", "5290"]}, ...]
+        token_list = []
+        for exchange_type, tokens in exchange_tokens.items():
+            token_list.append({
+                "exchangeType": exchange_type,
+                "tokens": tokens
+            })
+
+        # Send batch subscription if connected
+        if self.connected and self.ws_client and token_list:
+            try:
+                correlation_id = f"batch_{mode}_{int(time.time())}"
+                self.ws_client.subscribe(correlation_id, mode, token_list)
+                self.logger.info(f"Batch subscribed {len(symbols)} instruments in mode {mode}")
+            except Exception as e:
+                self.logger.error(f"Error batch subscribing: {e}")
+                # Mark all as failed
+                for r in results:
+                    if r.get('status') == 'success':
+                        r['status'] = 'error'
+                        r['message'] = str(e)
+
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+
+        return {
+            'status': 'success' if success_count == len(results) else 'partial' if success_count > 0 else 'error',
+            'message': f'Batch subscription: {success_count}/{len(results)} successful',
+            'results': results,
+            'batch_mode': True
+        }
+
+    def unsubscribe_batch(self, symbols: list, mode: int = 2) -> Dict[str, Any]:
+        """
+        Unsubscribe from multiple symbols in a single batch call.
+
+        Args:
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+            mode: Subscription mode - 1:LTP, 2:Quote, 3:Snap Quote
+
+        Returns:
+            dict: Response with status and list of unsubscription results
+        """
+        if not symbols:
+            return self._create_error_response("INVALID_PARAMETERS", "No symbols provided")
+
+        self.logger.info(f"Batch unsubscribing from {len(symbols)} symbols in mode {mode}")
+
+        # Group tokens by exchange type
+        exchange_tokens = {}
+        results = []
+
+        for symbol_info in symbols:
+            symbol = symbol_info.get('symbol', '')
+            exchange = symbol_info.get('exchange', '')
+
+            if not symbol or not exchange:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': 'Missing symbol or exchange'
+                })
+                continue
+
+            # Look up token
+            token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
+            if not token_info:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Token lookup failed for {symbol}.{exchange}'
+                })
+                continue
+
+            token = token_info['token']
+            brexchange = token_info['brexchange']
+            exchange_type = AngelExchangeMapper.get_exchange_type(brexchange)
+
+            if not exchange_type:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Exchange {exchange} not supported'
+                })
+                continue
+
+            # Group by exchange type
+            if exchange_type not in exchange_tokens:
+                exchange_tokens[exchange_type] = []
+            exchange_tokens[exchange_type].append(token)
+
+            # Remove subscription info
+            correlation_id = f"{symbol}_{exchange}_{mode}"
+            with self.lock:
+                if correlation_id in self.subscriptions:
+                    del self.subscriptions[correlation_id]
+
+            results.append({
+                'symbol': symbol,
+                'exchange': exchange,
+                'status': 'success',
+                'message': 'Unsubscription queued'
+            })
+
+        # Build token_list for batch unsubscription
+        token_list = []
+        for exchange_type, tokens in exchange_tokens.items():
+            token_list.append({
+                "exchangeType": exchange_type,
+                "tokens": tokens
+            })
+
+        # Send batch unsubscription if connected
+        if self.connected and self.ws_client and token_list:
+            try:
+                correlation_id = f"batch_unsub_{mode}_{int(time.time())}"
+                self.ws_client.unsubscribe(correlation_id, mode, token_list)
+                self.logger.info(f"Batch unsubscribed {len(symbols)} instruments in mode {mode}")
+            except Exception as e:
+                self.logger.error(f"Error batch unsubscribing: {e}")
+
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+
+        return {
+            'status': 'success' if success_count == len(results) else 'partial' if success_count > 0 else 'error',
+            'message': f'Batch unsubscription: {success_count}/{len(results)} successful',
+            'results': results,
+            'batch_mode': True
+        }
+
     def _on_open(self, wsapp) -> None:
         """Callback when connection is established"""
         self.logger.info("Connected to Angel WebSocket")
         self.connected = True
-        
+
         # Resubscribe to existing subscriptions if reconnecting
+        # Group by mode and exchange_type for batch resubscription
         with self.lock:
+            if not self.subscriptions:
+                return
+
+            # Group subscriptions by mode for batch resubscription
+            mode_groups = {}  # {mode: {exchange_type: [tokens]}}
+
             for correlation_id, sub in self.subscriptions.items():
+                mode = sub.get("mode", 2)
+                token = sub.get("token")
+                brexchange = sub.get("brexchange")
+
+                if not token or not brexchange:
+                    continue
+
+                exchange_type = AngelExchangeMapper.get_exchange_type(brexchange)
+                if not exchange_type:
+                    continue
+
+                if mode not in mode_groups:
+                    mode_groups[mode] = {}
+                if exchange_type not in mode_groups[mode]:
+                    mode_groups[mode][exchange_type] = []
+                mode_groups[mode][exchange_type].append(token)
+
+            # Batch resubscribe for each mode
+            for mode, exchange_tokens in mode_groups.items():
+                token_list = [
+                    {"exchangeType": ex_type, "tokens": tokens}
+                    for ex_type, tokens in exchange_tokens.items()
+                ]
                 try:
-                    self.ws_client.subscribe(correlation_id, sub["mode"], sub["token_list"])
-                    self.logger.info(f"Resubscribed to {sub['symbol']}.{sub['exchange']}")
+                    correlation_id = f"resub_{mode}_{int(time.time())}"
+                    self.ws_client.subscribe(correlation_id, mode, token_list)
+                    total_tokens = sum(len(t) for t in exchange_tokens.values())
+                    self.logger.info(f"Batch resubscribed {total_tokens} instruments in mode {mode}")
                 except Exception as e:
-                    self.logger.error(f"Error resubscribing to {sub['symbol']}.{sub['exchange']}: {e}")
+                    self.logger.error(f"Error batch resubscribing in mode {mode}: {e}")
     
     def _on_error(self, wsapp, error) -> None:
         """Callback for WebSocket errors"""
