@@ -20,6 +20,14 @@ from database.auth_db import verify_api_key
 from .broker_factory import create_broker_adapter
 from .base_adapter import BaseBrokerWebSocketAdapter
 
+# Batch subscription configuration
+# Set BATCH_SUBSCRIPTION_ENABLED=true in .env to enable batch mode
+BATCH_SUBSCRIPTION_ENABLED = os.getenv('BATCH_SUBSCRIPTION_ENABLED', 'true').lower() == 'true'
+
+def is_batch_subscription_enabled():
+    """Check if batch subscription mode is enabled"""
+    return BATCH_SUBSCRIPTION_ENABLED
+
 # Initialize logger
 logger = get_logger("websocket_proxy")
 
@@ -596,7 +604,7 @@ class WebSocketProxy:
     async def subscribe_client(self, client_id, data):
         """
         Subscribe a client to market data using their configured broker
-        
+
         Args:
             client_id: ID of the client
             data: Subscription data
@@ -605,108 +613,177 @@ class WebSocketProxy:
         if client_id not in self.user_mapping:
             await self.send_error(client_id, "NOT_AUTHENTICATED", "You must authenticate first")
             return
-        
+
         # Get subscription parameters
         symbols = data.get("symbols") or []  # Handle array of symbols
         mode_str = data.get("mode", "Quote")  # Get mode as string (LTP, Quote, Depth)
         depth_level = data.get("depth", 5)  # Default to 5 levels
-        
+
         # Map string mode to numeric mode
         mode_mapping = {
             "LTP": 1,
-            "Quote": 2, 
+            "Quote": 2,
             "Depth": 3
         }
-        
+
         # Convert string mode to numeric if needed
         mode = mode_mapping.get(mode_str, mode_str) if isinstance(mode_str, str) else mode_str
-        
+
         # Handle case where a single symbol is passed directly instead of as an array
         if not symbols and (data.get("symbol") and data.get("exchange")):
             symbols = [{
                 "symbol": data.get("symbol"),
                 "exchange": data.get("exchange")
             }]
-        
+
         if not symbols:
             await self.send_error(client_id, "INVALID_PARAMETERS", "At least one symbol must be specified")
             return
-        
+
         # Get the user's broker adapter
         user_id = self.user_mapping[client_id]
         if user_id not in self.broker_adapters:
             await self.send_error(client_id, "BROKER_ERROR", "Broker adapter not found")
             return
-        
+
         adapter = self.broker_adapters[user_id]
         broker_name = self.user_broker_mapping.get(user_id, "unknown")
-        
-        # Process each symbol in the subscription request
-        subscription_responses = []
-        subscription_success = True
-        
-        for symbol_info in symbols:
-            symbol = symbol_info.get("symbol")
-            exchange = symbol_info.get("exchange")
-            
-            if not symbol or not exchange:
-                continue  # Skip invalid symbols
-                
-            # Subscribe to market data
-            response = adapter.subscribe(symbol, exchange, mode, depth_level)
-            
-            if response.get("status") == "success":
-                # Store the subscription
-                subscription_info = {
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "mode": mode,
-                    "depth_level": depth_level,
-                    "broker": broker_name
-                }
 
-                if client_id in self.subscriptions:
-                    self.subscriptions[client_id].add(json.dumps(subscription_info))
+        # Check if batch subscription is enabled and adapter supports it
+        use_batch_subscription = (
+            is_batch_subscription_enabled() and
+            hasattr(adapter, 'subscribe_batch') and
+            len(symbols) > 1
+        )
+
+        if use_batch_subscription:
+            # BATCH SUBSCRIPTION MODE - Subscribe all symbols in one call
+            logger.info(f"Using batch subscription for {len(symbols)} symbols")
+
+            batch_response = adapter.subscribe_batch(symbols, mode, depth_level)
+            results = batch_response.get('results', [])
+
+            subscription_responses = []
+            subscription_success = True
+
+            for result in results:
+                symbol = result.get('symbol')
+                exchange = result.get('exchange')
+
+                if result.get('status') == 'success':
+                    # Store the subscription
+                    subscription_info = {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "mode": mode,
+                        "depth_level": depth_level,
+                        "broker": broker_name
+                    }
+
+                    if client_id in self.subscriptions:
+                        self.subscriptions[client_id].add(json.dumps(subscription_info))
+                    else:
+                        self.subscriptions[client_id] = {json.dumps(subscription_info)}
+
+                    # Update subscription index for O(1) lookup
+                    sub_key = (symbol, exchange, mode)
+                    self.subscription_index[sub_key].add(client_id)
+
+                    subscription_responses.append({
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "status": "success",
+                        "mode": mode_str,
+                        "depth": result.get("actual_depth", depth_level),
+                        "broker": broker_name
+                    })
                 else:
-                    self.subscriptions[client_id] = {json.dumps(subscription_info)}
+                    subscription_success = False
+                    subscription_responses.append({
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "status": "error",
+                        "message": result.get("message", "Subscription failed"),
+                        "broker": broker_name
+                    })
 
-                # OPTIMIZATION: Update subscription index for O(1) lookup
-                sub_key = (symbol, exchange, mode)
-                self.subscription_index[sub_key].add(client_id)
+            # Send combined response
+            await self.send_message(client_id, {
+                "type": "subscribe",
+                "status": "success" if subscription_success else "partial",
+                "subscriptions": subscription_responses,
+                "message": f"Batch subscription complete ({len(results)} symbols)",
+                "broker": broker_name,
+                "batch_mode": True
+            })
+        else:
+            # SEQUENTIAL SUBSCRIPTION MODE - Process each symbol individually
+            subscription_responses = []
+            subscription_success = True
 
-                # Add to successful subscriptions
-                subscription_responses.append({
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "status": "success",
-                    "mode": mode_str,
-                    "depth": response.get("actual_depth", depth_level),
-                    "broker": broker_name
-                })
-            else:
-                subscription_success = False
-                # Add to failed subscriptions
-                subscription_responses.append({
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "status": "error",
-                    "message": response.get("message", "Subscription failed"),
-                    "broker": broker_name
-                })
-        
-        # Send combined response
-        await self.send_message(client_id, {
-            "type": "subscribe",
-            "status": "success" if subscription_success else "partial",
-            "subscriptions": subscription_responses,
-            "message": "Subscription processing complete",
-            "broker": broker_name
-        })
+            for symbol_info in symbols:
+                symbol = symbol_info.get("symbol")
+                exchange = symbol_info.get("exchange")
+
+                if not symbol or not exchange:
+                    continue  # Skip invalid symbols
+
+                # Subscribe to market data
+                response = adapter.subscribe(symbol, exchange, mode, depth_level)
+
+                if response.get("status") == "success":
+                    # Store the subscription
+                    subscription_info = {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "mode": mode,
+                        "depth_level": depth_level,
+                        "broker": broker_name
+                    }
+
+                    if client_id in self.subscriptions:
+                        self.subscriptions[client_id].add(json.dumps(subscription_info))
+                    else:
+                        self.subscriptions[client_id] = {json.dumps(subscription_info)}
+
+                    # OPTIMIZATION: Update subscription index for O(1) lookup
+                    sub_key = (symbol, exchange, mode)
+                    self.subscription_index[sub_key].add(client_id)
+
+                    # Add to successful subscriptions
+                    subscription_responses.append({
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "status": "success",
+                        "mode": mode_str,
+                        "depth": response.get("actual_depth", depth_level),
+                        "broker": broker_name
+                    })
+                else:
+                    subscription_success = False
+                    # Add to failed subscriptions
+                    subscription_responses.append({
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "status": "error",
+                        "message": response.get("message", "Subscription failed"),
+                        "broker": broker_name
+                    })
+
+            # Send combined response
+            await self.send_message(client_id, {
+                "type": "subscribe",
+                "status": "success" if subscription_success else "partial",
+                "subscriptions": subscription_responses,
+                "message": "Subscription processing complete",
+                "broker": broker_name,
+                "batch_mode": False
+            })
     
     async def unsubscribe_client(self, client_id, data):
         """
         Unsubscribe a client from market data
-        
+
         Args:
             client_id: ID of the client
             data: Unsubscription data
@@ -715,44 +792,43 @@ class WebSocketProxy:
         if client_id not in self.user_mapping:
             await self.send_error(client_id, "NOT_AUTHENTICATED", "You must authenticate first")
             return
-        
+
         # Check if this is an unsubscribe_all request
         is_unsubscribe_all = data.get("type") == "unsubscribe_all" or data.get("action") == "unsubscribe_all"
-        
+
         # Get unsubscription parameters for specific symbols
         symbols = data.get("symbols") or []
-        
+        mode_str = data.get("mode", "Quote")
+
+        # Map string mode to numeric mode
+        mode_mapping = {"LTP": 1, "Quote": 2, "Depth": 3}
+        mode = mode_mapping.get(mode_str, mode_str) if isinstance(mode_str, str) else mode_str
+
         # Handle single symbol format
         if not symbols and not is_unsubscribe_all and (data.get("symbol") and data.get("exchange")):
             symbols = [{
                 "symbol": data.get("symbol"),
-                "exchange": data.get("exchange"),
-                "mode": data.get("mode", 2)  # Default to Quote mode
+                "exchange": data.get("exchange")
             }]
-        
+
         # If no symbols provided and not unsubscribe_all, return error
         if not symbols and not is_unsubscribe_all:
             await self.send_error(client_id, "INVALID_PARAMETERS", "Either symbols or unsubscribe_all is required")
             return
-        
+
         # Get the user's broker adapter
         user_id = self.user_mapping[client_id]
         if user_id not in self.broker_adapters:
             await self.send_error(client_id, "BROKER_ERROR", "Broker adapter not found")
             return
-        
+
         adapter = self.broker_adapters[user_id]
         broker_name = self.user_broker_mapping.get(user_id, "unknown")
-        
-        # Process unsubscribe request
-        successful_unsubscriptions = []
-        failed_unsubscriptions = []
-        
+
         # Handle unsubscribe_all case
         if is_unsubscribe_all:
             # Get all current subscriptions
             if client_id in self.subscriptions:
-                # Convert all stored subscription strings back to dictionaries
                 all_subscriptions = []
                 for sub_json in self.subscriptions[client_id]:
                     try:
@@ -760,72 +836,122 @@ class WebSocketProxy:
                         all_subscriptions.append(sub_dict)
                     except json.JSONDecodeError:
                         logger.error(f"Failed to parse subscription: {sub_json}")
-                
-                # Unsubscribe from each subscription
-                for sub in all_subscriptions:
-                    symbol = sub.get("symbol")
-                    exchange = sub.get("exchange")
-                    mode = sub.get("mode")
-                    
-                    if symbol and exchange:
-                        response = adapter.unsubscribe(symbol, exchange, mode)
-                        
-                        if response.get("status") == "success":
-                            successful_unsubscriptions.append({
-                                "symbol": symbol,
-                                "exchange": exchange,
-                                "status": "success",
-                                "broker": broker_name
-                            })
-                        else:
-                            failed_unsubscriptions.append({
-                                "symbol": symbol,
-                                "exchange": exchange,
-                                "status": "error",
-                                "message": response.get("message", "Unsubscription failed"),
-                                "broker": broker_name
-                            })
-                
-                # Clear all subscriptions for this client
+
+                # Use batch unsubscription if available
+                if all_subscriptions and hasattr(adapter, 'unsubscribe_batch'):
+                    symbols_to_unsub = [{"symbol": s.get("symbol"), "exchange": s.get("exchange")} for s in all_subscriptions]
+                    batch_response = adapter.unsubscribe_batch(symbols_to_unsub, mode)
+
+                    # Clear subscription index
+                    for sub in all_subscriptions:
+                        sub_key = (sub.get("symbol"), sub.get("exchange"), sub.get("mode"))
+                        if sub_key in self.subscription_index:
+                            self.subscription_index[sub_key].discard(client_id)
+
+                    self.subscriptions[client_id].clear()
+
+                    await self.send_message(client_id, {
+                        "type": "unsubscribe",
+                        "status": batch_response.get("status", "success"),
+                        "message": batch_response.get("message", "Batch unsubscription complete"),
+                        "successful": [r for r in batch_response.get("results", []) if r.get("status") == "success"],
+                        "failed": [r for r in batch_response.get("results", []) if r.get("status") != "success"],
+                        "broker": broker_name,
+                        "batch_mode": True
+                    })
+                    return
+
+                # Fallback to sequential
                 self.subscriptions[client_id].clear()
+
+            await self.send_message(client_id, {
+                "type": "unsubscribe",
+                "status": "success",
+                "message": "Unsubscribed from all symbols",
+                "broker": broker_name
+            })
+            return
+
+        # Check if batch unsubscription is enabled and adapter supports it
+        use_batch_unsubscription = (
+            is_batch_subscription_enabled() and
+            hasattr(adapter, 'unsubscribe_batch') and
+            len(symbols) > 1
+        )
+
+        if use_batch_unsubscription:
+            # BATCH UNSUBSCRIPTION MODE
+            logger.info(f"Using batch unsubscription for {len(symbols)} symbols")
+
+            batch_response = adapter.unsubscribe_batch(symbols, mode)
+            results = batch_response.get('results', [])
+
+            # Update subscription tracking
+            for result in results:
+                if result.get('status') == 'success':
+                    symbol = result.get('symbol')
+                    exchange = result.get('exchange')
+
+                    # Remove from subscription index
+                    sub_key = (symbol, exchange, mode)
+                    if sub_key in self.subscription_index:
+                        self.subscription_index[sub_key].discard(client_id)
+
+                    # Remove from client subscriptions
+                    if client_id in self.subscriptions:
+                        subscriptions_to_remove = []
+                        for sub_json in self.subscriptions[client_id]:
+                            try:
+                                sub_data = json.loads(sub_json)
+                                if sub_data.get("symbol") == symbol and sub_data.get("exchange") == exchange:
+                                    subscriptions_to_remove.append(sub_json)
+                            except json.JSONDecodeError:
+                                continue
+                        for sub_json in subscriptions_to_remove:
+                            self.subscriptions[client_id].discard(sub_json)
+
+            await self.send_message(client_id, {
+                "type": "unsubscribe",
+                "status": batch_response.get("status", "success"),
+                "message": f"Batch unsubscription complete ({len(results)} symbols)",
+                "successful": [r for r in results if r.get("status") == "success"],
+                "failed": [r for r in results if r.get("status") != "success"],
+                "broker": broker_name,
+                "batch_mode": True
+            })
         else:
-            # Process specific symbols
+            # SEQUENTIAL UNSUBSCRIPTION MODE
+            successful_unsubscriptions = []
+            failed_unsubscriptions = []
+
             for symbol_info in symbols:
                 symbol = symbol_info.get("symbol")
                 exchange = symbol_info.get("exchange")
-                mode = symbol_info.get("mode", 2)  # Default to Quote mode
-                
+
                 if not symbol or not exchange:
-                    continue  # Skip invalid symbols
-                
-                # Unsubscribe from market data
+                    continue
+
                 response = adapter.unsubscribe(symbol, exchange, mode)
-                
+
                 if response.get("status") == "success":
-                    # Try to remove subscription
+                    # Remove from subscription index
+                    sub_key = (symbol, exchange, mode)
+                    if sub_key in self.subscription_index:
+                        self.subscription_index[sub_key].discard(client_id)
+
+                    # Remove from client subscriptions
                     if client_id in self.subscriptions:
-                        subscription_info = {
-                            "symbol": symbol,
-                            "exchange": exchange,
-                            "mode": mode,
-                            "broker": broker_name
-                        }
-                        subscription_key = json.dumps(subscription_info)
-                        # Remove any matching subscription (with or without broker info)
                         subscriptions_to_remove = []
-                        for sub_key in self.subscriptions[client_id]:
+                        for sub_json in self.subscriptions[client_id]:
                             try:
-                                sub_data = json.loads(sub_key)
-                                if (sub_data.get("symbol") == symbol and 
-                                    sub_data.get("exchange") == exchange and 
-                                    sub_data.get("mode") == mode):
-                                    subscriptions_to_remove.append(sub_key)
+                                sub_data = json.loads(sub_json)
+                                if sub_data.get("symbol") == symbol and sub_data.get("exchange") == exchange:
+                                    subscriptions_to_remove.append(sub_json)
                             except json.JSONDecodeError:
                                 continue
-                        
-                        for sub_key in subscriptions_to_remove:
-                            self.subscriptions[client_id].discard(sub_key)
-                    
+                        for sub_json in subscriptions_to_remove:
+                            self.subscriptions[client_id].discard(sub_json)
+
                     successful_unsubscriptions.append({
                         "symbol": symbol,
                         "exchange": exchange,
@@ -840,22 +966,22 @@ class WebSocketProxy:
                         "message": response.get("message", "Unsubscription failed"),
                         "broker": broker_name
                     })
-        
-        # Send combined response
-        status = "success"
-        if len(failed_unsubscriptions) > 0 and len(successful_unsubscriptions) > 0:
-            status = "partial"
-        elif len(failed_unsubscriptions) > 0 and len(successful_unsubscriptions) == 0:
-            status = "error"
-            
-        await self.send_message(client_id, {
-            "type": "unsubscribe",
-            "status": status,
-            "message": "Unsubscription processing complete",
-            "successful": successful_unsubscriptions,
-            "failed": failed_unsubscriptions,
-            "broker": broker_name
-        })
+
+            status = "success"
+            if failed_unsubscriptions and successful_unsubscriptions:
+                status = "partial"
+            elif failed_unsubscriptions and not successful_unsubscriptions:
+                status = "error"
+
+            await self.send_message(client_id, {
+                "type": "unsubscribe",
+                "status": status,
+                "message": "Unsubscription processing complete",
+                "successful": successful_unsubscriptions,
+                "failed": failed_unsubscriptions,
+                "broker": broker_name,
+                "batch_mode": False
+            })
     
     async def send_message(self, client_id, message):
         """

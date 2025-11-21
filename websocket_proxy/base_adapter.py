@@ -191,17 +191,87 @@ class BaseBrokerWebSocketAdapter(ABC):
     def unsubscribe(self, symbol, exchange, mode=2):
         """
         Unsubscribe from market data
-        
+
         Args:
             symbol: Trading symbol
             exchange: Exchange code
             mode: Subscription mode
-            
+
         Returns:
             dict: Response with status
         """
         pass
-        
+
+    def subscribe_batch(self, symbols: list, mode: int = 2, depth_level: int = 5) -> dict:
+        """
+        Subscribe to multiple symbols in a single batch call.
+        Default implementation calls subscribe() for each symbol (sequential).
+        Broker adapters can override this for true parallel subscription.
+
+        Args:
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+            mode: Subscription mode - 1:LTP, 2:Quote, 3:Depth
+            depth_level: Market depth level (5, 20, or 30 depending on broker support)
+
+        Returns:
+            dict: Response with status and list of subscription results
+        """
+        results = []
+        for symbol_info in symbols:
+            symbol = symbol_info.get('symbol')
+            exchange = symbol_info.get('exchange')
+            if symbol and exchange:
+                result = self.subscribe(symbol, exchange, mode, depth_level)
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    **result
+                })
+
+        # Determine overall status
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+
+        return {
+            'status': 'success' if success_count == len(results) else 'partial' if success_count > 0 else 'error',
+            'message': f'Batch subscription: {success_count}/{len(results)} successful',
+            'results': results,
+            'batch_mode': True
+        }
+
+    def unsubscribe_batch(self, symbols: list, mode: int = 2) -> dict:
+        """
+        Unsubscribe from multiple symbols in a single batch call.
+        Default implementation calls unsubscribe() for each symbol (sequential).
+        Broker adapters can override this for true parallel unsubscription.
+
+        Args:
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+            mode: Subscription mode - 1:LTP, 2:Quote, 3:Depth
+
+        Returns:
+            dict: Response with status and list of unsubscription results
+        """
+        results = []
+        for symbol_info in symbols:
+            symbol = symbol_info.get('symbol')
+            exchange = symbol_info.get('exchange')
+            if symbol and exchange:
+                result = self.unsubscribe(symbol, exchange, mode)
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    **result
+                })
+
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+
+        return {
+            'status': 'success' if success_count == len(results) else 'partial' if success_count > 0 else 'error',
+            'message': f'Batch unsubscription: {success_count}/{len(results)} successful',
+            'results': results,
+            'batch_mode': True
+        }
+
     @abstractmethod
     def connect(self):
         """
