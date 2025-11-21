@@ -349,13 +349,195 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 del self.subscribed_symbols[key]
                 self.token_to_symbol.pop(token, None)
             
-            self.logger.info(f"✅ Unsubscribed from {exchange}:{symbol}")
+            self.logger.info(f"Unsubscribed from {exchange}:{symbol}")
             return {'status': 'success', 'message': f'Unsubscribed from {symbol}'}
-            
+
         except Exception as e:
             self.logger.error(f"Error unsubscribing from {exchange}:{symbol}: {e}")
             return {'status': 'error', 'message': str(e)}
-    
+
+    def subscribe_batch(self, symbols: list, mode: int = 2, depth_level: int = 5) -> Dict[str, Any]:
+        """
+        Subscribe to multiple symbols in a single batch call.
+        Zerodha supports up to 3000 instruments per connection.
+
+        Args:
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+            mode: Subscription mode - 1:LTP, 2:Quote, 3:Full
+            depth_level: Market depth level (not used in Zerodha)
+
+        Returns:
+            dict: Response with status and list of subscription results
+        """
+        self.logger.info(f"🚀 ZERODHA subscribe_batch called with {len(symbols)} symbols")
+
+        if not symbols:
+            return {'status': 'error', 'message': 'No symbols provided'}
+
+        if not self.ws_client:
+            return {'status': 'error', 'message': 'WebSocket client not initialized'}
+
+        if not self.running:
+            return {'status': 'error', 'message': 'WebSocket not connected'}
+
+        self.logger.info(f"Batch subscribing to {len(symbols)} symbols in mode {mode}")
+
+        tokens_to_subscribe = []
+        results = []
+
+        for symbol_info in symbols:
+            symbol = symbol_info.get('symbol', '')
+            exchange = symbol_info.get('exchange', '')
+
+            if not symbol or not exchange:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': 'Missing symbol or exchange'
+                })
+                continue
+
+            token_data = get_token(symbol, exchange)
+            if not token_data:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Token not found for {symbol} on {exchange}'
+                })
+                continue
+
+            if isinstance(token_data, dict):
+                token = token_data.get('token')
+            elif isinstance(token_data, str):
+                if '::::' in token_data:
+                    token = token_data.split('::::')[0]
+                elif ':' in token_data:
+                    token = token_data.split(':')[0]
+                else:
+                    token = token_data
+            else:
+                token = str(token_data)
+
+            try:
+                token = int(token)
+            except ValueError:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': f'Invalid token format: {token}'
+                })
+                continue
+
+            tokens_to_subscribe.append(token)
+
+            key = f"{exchange}:{symbol}"
+            with self.lock:
+                self.subscribed_symbols[key] = {
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'token': token,
+                    'mode': mode
+                }
+                self.token_to_symbol[token] = (symbol, exchange)
+
+            results.append({
+                'symbol': symbol,
+                'exchange': exchange,
+                'status': 'success',
+                'message': 'Subscription queued'
+            })
+
+        if tokens_to_subscribe:
+            zerodha_mode = self.mode_map.get(mode, ZerodhaWebSocket.MODE_QUOTE)
+            self.ws_client.subscribe_tokens(tokens_to_subscribe, zerodha_mode)
+            self.logger.info(f"Batch subscribed {len(tokens_to_subscribe)} tokens in {zerodha_mode} mode")
+
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+
+        return {
+            'status': 'success' if success_count == len(results) else 'partial' if success_count > 0 else 'error',
+            'message': f'Batch subscription: {success_count}/{len(results)} successful',
+            'results': results,
+            'batch_mode': True
+        }
+
+    def unsubscribe_batch(self, symbols: list, mode: int = 2) -> Dict[str, Any]:
+        """
+        Unsubscribe from multiple symbols in a single batch call.
+
+        Args:
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+            mode: Subscription mode
+
+        Returns:
+            dict: Response with status and list of unsubscription results
+        """
+        if not symbols:
+            return {'status': 'error', 'message': 'No symbols provided'}
+
+        self.logger.info(f"Batch unsubscribing from {len(symbols)} symbols")
+
+        tokens_to_unsubscribe = []
+        results = []
+
+        for symbol_info in symbols:
+            symbol = symbol_info.get('symbol', '')
+            exchange = symbol_info.get('exchange', '')
+
+            if not symbol or not exchange:
+                results.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'status': 'error',
+                    'message': 'Missing symbol or exchange'
+                })
+                continue
+
+            key = f"{exchange}:{symbol}"
+
+            with self.lock:
+                if key not in self.subscribed_symbols:
+                    results.append({
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'status': 'error',
+                        'message': f'Not subscribed to {symbol}'
+                    })
+                    continue
+
+                subscription = self.subscribed_symbols[key]
+                token = subscription['token']
+                tokens_to_unsubscribe.append(token)
+
+                del self.subscribed_symbols[key]
+                self.token_to_symbol.pop(token, None)
+
+            results.append({
+                'symbol': symbol,
+                'exchange': exchange,
+                'status': 'success',
+                'message': 'Unsubscription queued'
+            })
+
+        if tokens_to_unsubscribe and self.ws_client:
+            asyncio.run_coroutine_threadsafe(
+                self.ws_client.unsubscribe(tokens_to_unsubscribe),
+                self.ws_client.loop
+            )
+            self.logger.info(f"Batch unsubscribed {len(tokens_to_unsubscribe)} tokens")
+
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+
+        return {
+            'status': 'success' if success_count == len(results) else 'partial' if success_count > 0 else 'error',
+            'message': f'Batch unsubscription: {success_count}/{len(results)} successful',
+            'results': results,
+            'batch_mode': True
+        }
+
     def get_subscriptions(self) -> Dict[str, Any]:
         """Get current subscriptions"""
         with self.lock:
