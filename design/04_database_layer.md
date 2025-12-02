@@ -1,508 +1,408 @@
-# OpenAlgo Database Layer Design
+# Database Layer Architecture
 
-## Executive Summary
+OpenAlgo implements a sophisticated multi-database architecture with intelligent caching, supporting both SQLite (development) and PostgreSQL (production) through SQLAlchemy ORM.
 
-The database layer provides comprehensive data persistence for the OpenAlgo trading platform, managing everything from user authentication and broker credentials to trading history, strategy configurations, and Telegram bot data. Built on SQLAlchemy ORM, it offers database-agnostic support with optimized connection pooling and secure data handling.
+## Multi-Database Architecture
 
-## Architecture Overview
+OpenAlgo uses **5 separate databases** to isolate different concerns:
 
-### Technology Stack
-
-- **ORM**: SQLAlchemy 2.0+ with declarative models
-- **Database Support**: SQLite (development), PostgreSQL/MySQL (production)
-- **Migration**: Alembic for schema versioning
-- **Connection Pooling**: Optimized pooling with 50 base, 100 max overflow
-- **Encryption**: Fernet encryption for sensitive data
-- **Hashing**: Argon2 for password and API key hashing
-
-### Database Architecture
-
-```mermaid
-graph TB
-    subgraph "Application Layer"
-        Flask[Flask Application]
-        Services[Service Layer]
-        API[REST API]
-    end
-
-    subgraph "Database Access Layer"
-        ORM[SQLAlchemy ORM]
-        Sessions[Session Management]
-        Pooling[Connection Pooling]
-    end
-
-    subgraph "Data Models"
-        Auth[Authentication Models]
-        User[User Models]
-        Trading[Trading Models]
-        Strategy[Strategy Models]
-        Telegram[Telegram Models]
-        Analytics[Analytics Models]
-        Settings[Settings Models]
-    end
-
-    subgraph "Physical Database"
-        SQLite[SQLite DB]
-        PostgreSQL[PostgreSQL]
-        MySQL[MySQL]
-    end
-
-    Flask --> Services
-    Services --> API
-    API --> ORM
-    ORM --> Sessions
-    Sessions --> Pooling
-    Pooling --> Auth
-    Pooling --> User
-    Pooling --> Trading
-    Pooling --> Strategy
-    Pooling --> Telegram
-    Pooling --> Analytics
-    Pooling --> Settings
-
-    Auth --> SQLite
-    Auth --> PostgreSQL
-    Auth --> MySQL
+```
+databases/
+├── openalgo.db          # Main application database
+├── openalgo_sandbox.db  # Paper trading sandbox
+├── latency.db           # Order execution metrics
+├── logs.db              # Application logging
+└── telegram.db          # Telegram bot state
 ```
 
-## Core Database Models
+### Database Configuration
 
-### 1. Authentication & Authorization
-
-#### Auth Model (`database/auth_db.py`)
 ```python
-class Auth(Base):
-    __tablename__ = 'auth'
-
-    id = Column(Integer, primary_key=True)
-    name = Column(String(255), unique=True, nullable=False)
-    auth = Column(Text, nullable=False)  # Encrypted auth token
-    feed_token = Column(Text, nullable=True)  # Encrypted feed token
-    broker = Column(String(20), nullable=False)
-    user_id = Column(String(255), nullable=True)
-    is_revoked = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    # Indexes
-    __table_args__ = (
-        Index('idx_auth_name', 'name'),
-        Index('idx_auth_broker', 'broker'),
-        Index('idx_auth_revoked', 'is_revoked'),
-    )
+# database/db_init.py
+DATABASE_URLS = {
+    'main': os.getenv('DATABASE_URL', 'sqlite:///databases/openalgo.db'),
+    'sandbox': os.getenv('SANDBOX_DATABASE_URL', 'sqlite:///databases/openalgo_sandbox.db'),
+    'latency': os.getenv('LATENCY_DATABASE_URL', 'sqlite:///databases/latency.db'),
+    'logs': os.getenv('LOGS_DATABASE_URL', 'sqlite:///databases/logs.db'),
+    'telegram': os.getenv('TELEGRAM_DATABASE_URL', 'sqlite:///databases/telegram.db')
+}
 ```
 
-#### API Keys Model (`database/auth_db.py`)
+### Connection Pooling
+
+| Database Type | Pool Size | Max Overflow | Timeout |
+|---------------|-----------|--------------|---------|
+| PostgreSQL    | 50        | 100          | 30s     |
+| SQLite        | NullPool  | N/A          | N/A     |
+
 ```python
-class ApiKeys(Base):
-    __tablename__ = 'api_keys'
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(String, nullable=False, unique=True)
-    api_key_hash = Column(Text, nullable=False)  # Argon2 hash
-    api_key_encrypted = Column(Text, nullable=False)  # Fernet encrypted
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    last_used = Column(DateTime(timezone=True))
-    is_active = Column(Boolean, default=True)
-
-    __table_args__ = (
-        Index('idx_apikey_user', 'user_id'),
-        Index('idx_apikey_active', 'is_active'),
-    )
+def get_engine_options(url):
+    if 'postgresql' in url:
+        return {
+            'pool_size': 50,
+            'max_overflow': 100,
+            'pool_timeout': 30,
+            'pool_recycle': 1800,
+            'pool_pre_ping': True
+        }
+    return {'poolclass': NullPool}  # SQLite
 ```
 
-### 2. User Management
+## Database Models
 
-#### User Model (`database/user_db.py`)
+### Main Database Tables (25+)
+
+#### User Management
+
+**User Table** (`user_db.py`)
 ```python
 class User(Base):
-    __tablename__ = 'users'
-
+    __tablename__ = 'user'
     id = Column(Integer, primary_key=True)
     username = Column(String(80), unique=True, nullable=False)
     email = Column(String(120), unique=True, nullable=False)
-    password_hash = Column(String(255), nullable=False)  # Argon2 with pepper
-    totp_secret = Column(String(32), nullable=False)  # 2FA secret
-    is_admin = Column(Boolean, default=False)
+    password_hash = Column(String(255), nullable=False)  # Argon2 hash
+    created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    last_login = Column(DateTime(timezone=True))
-
-    # Relationships
-    api_keys = relationship("ApiKeys", back_populates="user")
-    strategies = relationship("Strategy", back_populates="user")
-    telegram_accounts = relationship("TelegramUser", back_populates="user")
-
-    __table_args__ = (
-        Index('idx_user_username', 'username'),
-        Index('idx_user_email', 'email'),
-    )
 ```
 
-### 3. Telegram Bot Integration
-
-#### Telegram User Model (`database/telegram_db.py`)
+**API Key Table** (`apikey_db.py`)
 ```python
-class TelegramUser(Base):
-    __tablename__ = 'telegram_users'
-
+class ApiKey(Base):
+    __tablename__ = 'api_keys'
     id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
-    username = Column(String(255))
-    first_name = Column(String(255))
-    last_name = Column(String(255))
-    api_key_encrypted = Column(Text, nullable=False)  # Fernet encrypted
-    host_url = Column(String(255), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    user_id = Column(Integer, ForeignKey('user.id'), nullable=False)
+    api_key = Column(String(64), unique=True, nullable=False)
+    name = Column(String(100))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_used = Column(DateTime)
     is_active = Column(Boolean, default=True)
-    last_command_at = Column(DateTime(timezone=True))
-
-    # Relationships
-    command_logs = relationship("CommandLog", back_populates="telegram_user")
-
-    __table_args__ = (
-        Index('idx_telegram_id', 'telegram_id'),
-        Index('idx_telegram_active', 'is_active'),
-    )
 ```
 
-#### Bot Configuration Model (`database/telegram_db.py`)
+#### Broker Authentication
+
+**Auth Token Table** (`auth_db.py`)
 ```python
-class BotConfig(Base):
-    __tablename__ = 'bot_config'
-
+class AuthToken(Base):
+    __tablename__ = 'auth_tokens'
     id = Column(Integer, primary_key=True)
-    bot_token_encrypted = Column(Text)  # Fernet encrypted
-    webhook_url = Column(String(500))
-    is_polling = Column(Boolean, default=True)
-    is_active = Column(Boolean, default=False)
-    auto_start = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    user_id = Column(Integer, ForeignKey('user.id'), nullable=False)
+    broker = Column(String(50), nullable=False)
+    access_token = Column(Text)           # Fernet encrypted
+    refresh_token = Column(Text)          # Fernet encrypted
+    feed_token = Column(Text)             # Fernet encrypted (Angel/Dhan)
+    token_expiry = Column(DateTime)
+    auth_data = Column(JSON)              # Additional broker-specific data
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
 ```
 
-#### Command Log Model (`database/telegram_db.py`)
-```python
-class CommandLog(Base):
-    __tablename__ = 'command_logs'
+#### Trading Operations
 
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, ForeignKey('telegram_users.telegram_id'), nullable=False)
-    command = Column(String(100), nullable=False)
-    parameters = Column(Text)
-    response_time_ms = Column(Integer)
-    success = Column(Boolean, default=True)
-    error_message = Column(Text)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    # Relationships
-    telegram_user = relationship("TelegramUser", back_populates="command_logs")
-
-    __table_args__ = (
-        Index('idx_command_telegram_id', 'telegram_id'),
-        Index('idx_command_created', 'created_at'),
-        Index('idx_command_name', 'command'),
-    )
-```
-
-### 4. Trading Data
-
-#### Order Model (`database/order_db.py`)
+**Order Book Table** (`orderbook_db.py`)
 ```python
 class Order(Base):
     __tablename__ = 'orders'
-
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    broker = Column(String(20), nullable=False)
     order_id = Column(String(50), unique=True, nullable=False)
-    exchange = Column(String(10), nullable=False)
+    user_id = Column(Integer, ForeignKey('user.id'), nullable=False)
+    broker = Column(String(50), nullable=False)
     symbol = Column(String(50), nullable=False)
-    action = Column(String(10), nullable=False)  # BUY/SELL
-    quantity = Column(Integer, nullable=False)
-    price = Column(Numeric(10, 2))
-    price_type = Column(String(20))  # MARKET/LIMIT/SL/SLM
-    product = Column(String(20))  # MIS/CNC/NRML
-    status = Column(String(20))  # PENDING/COMPLETE/REJECTED/CANCELLED
-    filled_quantity = Column(Integer, default=0)
-    average_price = Column(Numeric(10, 2))
-    order_datetime = Column(DateTime(timezone=True), server_default=func.now())
-
-    __table_args__ = (
-        Index('idx_order_user', 'user_id'),
-        Index('idx_order_id', 'order_id'),
-        Index('idx_order_status', 'status'),
-        Index('idx_order_datetime', 'order_datetime'),
-    )
+    exchange = Column(String(20), nullable=False)
+    action = Column(String(10))           # BUY/SELL
+    quantity = Column(Integer)
+    price = Column(Float)
+    trigger_price = Column(Float)
+    order_type = Column(String(20))       # MARKET/LIMIT/SL/SL-M
+    product = Column(String(20))          # CNC/MIS/NRML
+    status = Column(String(20))           # OPEN/COMPLETE/CANCELLED/REJECTED
+    fill_price = Column(Float)
+    fill_quantity = Column(Integer)
+    placed_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
 ```
 
-#### Position Model (`database/position_db.py`)
+**Trade Book Table** (`tradebook_db.py`)
+```python
+class Trade(Base):
+    __tablename__ = 'trades'
+    id = Column(Integer, primary_key=True)
+    trade_id = Column(String(50), unique=True)
+    order_id = Column(String(50), ForeignKey('orders.order_id'))
+    user_id = Column(Integer, ForeignKey('user.id'))
+    symbol = Column(String(50))
+    exchange = Column(String(20))
+    action = Column(String(10))
+    quantity = Column(Integer)
+    price = Column(Float)
+    traded_at = Column(DateTime)
+```
+
+**Position Book Table** (`positionbook_db.py`)
 ```python
 class Position(Base):
     __tablename__ = 'positions'
-
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    broker = Column(String(20), nullable=False)
-    exchange = Column(String(10), nullable=False)
-    symbol = Column(String(50), nullable=False)
-    product = Column(String(20))  # MIS/CNC/NRML
-    quantity = Column(Integer, nullable=False)
-    buy_quantity = Column(Integer, default=0)
-    sell_quantity = Column(Integer, default=0)
-    net_quantity = Column(Integer, default=0)
-    buy_price = Column(Numeric(10, 2))
-    sell_price = Column(Numeric(10, 2))
-    net_price = Column(Numeric(10, 2))
-    pnl = Column(Numeric(10, 2))
-    mtm = Column(Numeric(10, 2))
-    ltp = Column(Numeric(10, 2))
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    __table_args__ = (
-        Index('idx_position_user', 'user_id'),
-        Index('idx_position_symbol', 'symbol'),
-        UniqueConstraint('user_id', 'broker', 'exchange', 'symbol', 'product'),
-    )
+    user_id = Column(Integer, ForeignKey('user.id'))
+    broker = Column(String(50))
+    symbol = Column(String(50))
+    exchange = Column(String(20))
+    product = Column(String(20))
+    quantity = Column(Integer)
+    average_price = Column(Float)
+    last_price = Column(Float)
+    pnl = Column(Float)
+    day_quantity = Column(Integer)
+    overnight_quantity = Column(Integer)
 ```
 
-### 5. Strategy Management
+**Holdings Table** (`holdings_db.py`)
+```python
+class Holding(Base):
+    __tablename__ = 'holdings'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('user.id'))
+    broker = Column(String(50))
+    symbol = Column(String(50))
+    exchange = Column(String(20))
+    isin = Column(String(20))
+    quantity = Column(Integer)
+    average_price = Column(Float)
+    last_price = Column(Float)
+    pnl = Column(Float)
+    pnl_percent = Column(Float)
+```
 
-#### Strategy Model (`database/strategy_db.py`)
+#### Strategy Management
+
+**Strategy Table** (`strategy_db.py`)
 ```python
 class Strategy(Base):
     __tablename__ = 'strategies'
-
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    name = Column(String(255), nullable=False)
-    file_path = Column(String(500), nullable=False)
-    status = Column(String(20))  # PENDING/RUNNING/STOPPED/ERROR
-    is_scheduled = Column(Boolean, default=False)
-    schedule_start = Column(Time)
-    schedule_stop = Column(Time)
-    schedule_days = Column(JSON)  # ["mon", "tue", "wed", "thu", "fri"]
-    pid = Column(Integer)  # Process ID when running
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    last_run_at = Column(DateTime(timezone=True))
-    error_message = Column(Text)
-
-    # Relationships
-    user = relationship("User", back_populates="strategies")
-    logs = relationship("StrategyLog", back_populates="strategy")
-
-    __table_args__ = (
-        Index('idx_strategy_user', 'user_id'),
-        Index('idx_strategy_status', 'status'),
-        UniqueConstraint('user_id', 'name'),
-    )
+    user_id = Column(Integer, ForeignKey('user.id'))
+    name = Column(String(100), nullable=False)
+    description = Column(Text)
+    strategy_type = Column(String(50))    # webhook/python/chartink
+    config = Column(JSON)
+    is_active = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
 ```
 
-#### Strategy Log Model (`database/strategy_db.py`)
+#### Symbol Management
+
+**Symbol Master Table** (`symbol_db.py`)
 ```python
-class StrategyLog(Base):
-    __tablename__ = 'strategy_logs'
-
+class Symbol(Base):
+    __tablename__ = 'symbols'
     id = Column(Integer, primary_key=True)
-    strategy_id = Column(Integer, ForeignKey('strategies.id'), nullable=False)
-    log_level = Column(String(20))  # INFO/WARNING/ERROR/DEBUG
-    message = Column(Text)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    # Relationships
-    strategy = relationship("Strategy", back_populates="logs")
-
-    __table_args__ = (
-        Index('idx_strategylog_strategy', 'strategy_id'),
-        Index('idx_strategylog_created', 'created_at'),
-    )
-```
-
-### 6. Master Contract/Instrument Data
-
-#### Token Model (`database/token_db.py`)
-```python
-class Token(Base):
-    __tablename__ = 'tokens'
-
-    id = Column(Integer, primary_key=True)
-    broker = Column(String(20), nullable=False)
-    exchange = Column(String(10), nullable=False)
+    broker = Column(String(50), nullable=False)
     symbol = Column(String(50), nullable=False)
-    token = Column(String(50), nullable=False)
-    instrument_type = Column(String(20))  # EQ/FUT/OPT
-    expiry = Column(Date)
-    strike = Column(Numeric(10, 2))
-    option_type = Column(String(2))  # CE/PE
+    broker_symbol = Column(String(100))
+    token = Column(String(50))
+    exchange = Column(String(20))
+    instrument_type = Column(String(20))
     lot_size = Column(Integer)
-    tick_size = Column(Numeric(5, 2))
-    openalgo_symbol = Column(String(100), nullable=False)
+    tick_size = Column(Float)
+    expiry = Column(Date)
+    strike = Column(Float)
+    option_type = Column(String(5))       # CE/PE
+    last_updated = Column(DateTime)
 
     __table_args__ = (
-        Index('idx_token_broker', 'broker'),
-        Index('idx_token_symbol', 'symbol'),
-        Index('idx_token_openalgo', 'openalgo_symbol'),
-        UniqueConstraint('broker', 'exchange', 'token'),
+        UniqueConstraint('broker', 'symbol', 'exchange', name='uix_symbol'),
     )
 ```
 
-### 7. Analytics and Monitoring
+### Sandbox Database
 
-#### API Log Model (`database/apilog_db.py`)
+Mirrors main database structure for paper trading:
+
 ```python
-class ApiLog(Base):
-    __tablename__ = 'api_logs'
+# database/sandbox_db.py
+class SandboxOrder(Base):
+    __tablename__ = 'sandbox_orders'
+    # Same structure as Order, isolated for paper trading
 
+class SandboxPosition(Base):
+    __tablename__ = 'sandbox_positions'
+    # Same structure as Position
+
+class SandboxTrade(Base):
+    __tablename__ = 'sandbox_trades'
+    # Same structure as Trade
+```
+
+### Latency Database
+
+**Latency Metrics Table** (`latency_db.py`)
+```python
+class LatencyMetric(Base):
+    __tablename__ = 'latency_metrics'
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'))
-    api_key = Column(String(100))  # Hashed
-    endpoint = Column(String(255), nullable=False)
-    method = Column(String(10), nullable=False)
-    request_body = Column(JSON)
-    response_body = Column(JSON)
-    status_code = Column(Integer)
-    response_time_ms = Column(Integer)
-    broker = Column(String(20))
+    order_id = Column(String(50))
+    broker = Column(String(50))
+    operation = Column(String(50))        # place_order/modify_order/cancel_order
+    start_time = Column(DateTime)
+    end_time = Column(DateTime)
+    latency_ms = Column(Float)
+    success = Column(Boolean)
     error_message = Column(Text)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    __table_args__ = (
-        Index('idx_apilog_user', 'user_id'),
-        Index('idx_apilog_endpoint', 'endpoint'),
-        Index('idx_apilog_created', 'created_at'),
-    )
 ```
 
-#### Traffic Model (`database/traffic_db.py`)
-```python
-class Traffic(Base):
-    __tablename__ = 'traffic'
+### Logs Database
 
+**Application Log Table** (`logs_db.py`)
+```python
+class ApplicationLog(Base):
+    __tablename__ = 'application_logs'
     id = Column(Integer, primary_key=True)
-    ip_address = Column(String(45))
-    user_agent = Column(String(500))
-    endpoint = Column(String(255), nullable=False)
-    method = Column(String(10), nullable=False)
-    request_size = Column(Integer)
-    response_size = Column(Integer)
-    response_time_ms = Column(Integer)
-    status_code = Column(Integer)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    __table_args__ = (
-        Index('idx_traffic_endpoint', 'endpoint'),
-        Index('idx_traffic_created', 'created_at'),
-        Index('idx_traffic_ip', 'ip_address'),
-    )
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    level = Column(String(20))            # DEBUG/INFO/WARNING/ERROR/CRITICAL
+    logger = Column(String(100))
+    message = Column(Text)
+    module = Column(String(100))
+    function = Column(String(100))
+    line_number = Column(Integer)
+    exception = Column(Text)
+    extra_data = Column(JSON)
 ```
 
-#### Latency Model (`database/latency_db.py`)
-```python
-class Latency(Base):
-    __tablename__ = 'latency'
+### Telegram Database
 
+**Chat State Table** (`telegram_db.py`)
+```python
+class TelegramChat(Base):
+    __tablename__ = 'telegram_chats'
     id = Column(Integer, primary_key=True)
-    broker = Column(String(20), nullable=False)
-    endpoint = Column(String(255), nullable=False)
-    latency_ms = Column(Integer, nullable=False)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    chat_id = Column(BigInteger, unique=True, nullable=False)
+    user_id = Column(Integer, ForeignKey('user.id'))
+    username = Column(String(100))
+    is_authorized = Column(Boolean, default=False)
+    notification_enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-    __table_args__ = (
-        Index('idx_latency_broker', 'broker'),
-        Index('idx_latency_timestamp', 'timestamp'),
-    )
-```
-
-### 8. Settings and Configuration
-
-#### Settings Model (`database/settings_db.py`)
-```python
-class Settings(Base):
-    __tablename__ = 'settings'
-
+class TelegramMessage(Base):
+    __tablename__ = 'telegram_messages'
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'))
-    key = Column(String(100), nullable=False)
-    value = Column(JSON)
-    category = Column(String(50))  # TRADING/UI/NOTIFICATION
-    is_encrypted = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    __table_args__ = (
-        Index('idx_settings_user', 'user_id'),
-        Index('idx_settings_key', 'key'),
-        UniqueConstraint('user_id', 'key'),
-    )
+    chat_id = Column(BigInteger, ForeignKey('telegram_chats.chat_id'))
+    message_type = Column(String(50))     # order/alert/error
+    content = Column(Text)
+    sent_at = Column(DateTime, default=datetime.utcnow)
+    delivered = Column(Boolean, default=False)
 ```
 
-### 9. ChartInk Integration
+## Caching Architecture
 
-#### ChartInk Webhook Model (`database/chartink_db.py`)
+### TTLCache Implementation
+
+OpenAlgo uses `cachetools.TTLCache` for high-performance in-memory caching:
+
 ```python
-class ChartInkWebhook(Base):
-    __tablename__ = 'chartink_webhooks'
+from cachetools import TTLCache
 
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    webhook_id = Column(String(100), unique=True, nullable=False)
-    name = Column(String(255), nullable=False)
-    strategy_type = Column(String(50))  # SCANNER/ALERT
-    is_active = Column(Boolean, default=True)
-    configuration = Column(JSON)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    last_triggered = Column(DateTime(timezone=True))
-    trigger_count = Column(Integer, default=0)
+# API Key Cache - 10 hour TTL for valid keys
+api_key_cache = TTLCache(maxsize=1000, ttl=36000)
 
-    __table_args__ = (
-        Index('idx_chartink_user', 'user_id'),
-        Index('idx_chartink_webhook', 'webhook_id'),
-    )
+# Invalid Key Cache - 5 minute TTL to prevent brute force
+invalid_key_cache = TTLCache(maxsize=10000, ttl=300)
+
+# Symbol Cache - Session-based expiry
+symbol_cache = TTLCache(maxsize=50000, ttl=get_ttl_to_session_end())
+
+# Token Cache - 24 hour TTL
+token_cache = TTLCache(maxsize=500, ttl=86400)
 ```
 
-## Database Configuration
+### Session-Based Cache Expiry
 
-### Connection Settings
+Caches expire at 3:00 AM IST daily (market session boundary):
 
 ```python
-# Environment Variables
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///openalgo.db')
+def get_ttl_to_session_end():
+    """Calculate seconds until 3:00 AM IST"""
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
 
-# Connection Pool Configuration
-DB_POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '50'))
-DB_MAX_OVERFLOW = int(os.getenv('DB_MAX_OVERFLOW', '100'))
-DB_POOL_TIMEOUT = int(os.getenv('DB_POOL_TIMEOUT', '30'))
-DB_POOL_RECYCLE = int(os.getenv('DB_POOL_RECYCLE', '3600'))
+    # Next 3:00 AM IST
+    next_session_end = now.replace(hour=3, minute=0, second=0, microsecond=0)
+    if now.hour >= 3:
+        next_session_end += timedelta(days=1)
 
-# SQLAlchemy Engine Configuration
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=DB_POOL_SIZE,
-    max_overflow=DB_MAX_OVERFLOW,
-    pool_timeout=DB_POOL_TIMEOUT,
-    pool_recycle=DB_POOL_RECYCLE,
-    pool_pre_ping=True,  # Test connections before use
-    echo=False  # Set to True for SQL logging
-)
+    return (next_session_end - now).total_seconds()
 ```
 
-### Session Management
+### Cache Flow Diagram
+
+```
+API Request
+    |
+    v
++------------------+
+| Check API Key    |
+| Cache (10hr)     |
++--------+---------+
+         |
+    Cache Hit? ---Yes---> Return Cached Result
+         |
+         No
+         |
+         v
++------------------+
+| Check Invalid    |
+| Cache (5min)     |
++--------+---------+
+         |
+    In Invalid? ---Yes---> Return 401 Immediately
+         |
+         No
+         |
+         v
++------------------+
+| Database Query   |
++--------+---------+
+         |
+         v
++------------------+
+| Update Cache     |
+| (Valid/Invalid)  |
++------------------+
+```
+
+## Database Operations
+
+### CRUD Functions
+
+Each database module provides standard CRUD operations:
 
 ```python
-from sqlalchemy.orm import sessionmaker, scoped_session
+# database/user_db.py
+def create_user(username, email, password_hash):
+    """Create new user record"""
 
-# Create session factory
-SessionFactory = sessionmaker(bind=engine)
+def get_user_by_username(username):
+    """Retrieve user by username"""
 
-# Create scoped session for thread-safe operations
-Session = scoped_session(SessionFactory)
+def get_user_by_api_key(api_key):
+    """Retrieve user associated with API key"""
 
-# Context manager for database operations
+def update_user(user_id, **kwargs):
+    """Update user attributes"""
+
+def delete_user(user_id):
+    """Soft delete user (set is_active=False)"""
+```
+
+### Transaction Management
+
+```python
+from contextlib import contextmanager
+
 @contextmanager
-def get_db_session():
-    session = Session()
+def get_db_session(database='main'):
+    """Provide transactional scope around operations"""
+    session = Session(get_engine(database))
     try:
         yield session
         session.commit()
@@ -511,294 +411,184 @@ def get_db_session():
         raise
     finally:
         session.close()
+
+# Usage
+with get_db_session('main') as session:
+    order = Order(symbol='RELIANCE', quantity=100)
+    session.add(order)
+    # Auto-commit on context exit
 ```
 
-## Security Features
-
-### 1. Encryption at Rest
+### Bulk Operations
 
 ```python
-# Fernet encryption for sensitive data
-from cryptography.fernet import Fernet
+def bulk_insert_symbols(symbols_data, broker):
+    """Efficiently insert many symbols"""
+    with get_db_session() as session:
+        session.bulk_insert_mappings(Symbol, symbols_data)
 
-class EncryptionManager:
-    def __init__(self):
-        self.cipher_suite = Fernet(get_encryption_key())
-
-    def encrypt(self, data: str) -> str:
-        """Encrypt string data"""
-        return self.cipher_suite.encrypt(data.encode()).decode()
-
-    def decrypt(self, encrypted_data: str) -> str:
-        """Decrypt string data"""
-        return self.cipher_suite.decrypt(encrypted_data.encode()).decode()
+def bulk_update_positions(positions_data):
+    """Update multiple positions atomically"""
+    with get_db_session() as session:
+        session.bulk_update_mappings(Position, positions_data)
 ```
 
-### 2. Password Hashing
+## Database Initialization
+
+### Startup Sequence
 
 ```python
-# Argon2 hashing with pepper
-from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+# database/db_init.py
+def init_databases():
+    """Initialize all databases on application startup"""
 
-class PasswordManager:
-    def __init__(self):
-        self.hasher = PasswordHasher()
-        self.pepper = os.getenv('API_KEY_PEPPER', '')
+    # 1. Create database directories
+    os.makedirs('databases', exist_ok=True)
 
-    def hash_password(self, password: str) -> str:
-        """Hash password with Argon2 and pepper"""
-        return self.hasher.hash(password + self.pepper)
+    # 2. Initialize engines for each database
+    for db_name, url in DATABASE_URLS.items():
+        engine = create_engine(url, **get_engine_options(url))
+        engines[db_name] = engine
 
-    def verify_password(self, password: str, hash: str) -> bool:
-        """Verify password against hash"""
-        try:
-            self.hasher.verify(hash, password + self.pepper)
-            return True
-        except VerifyMismatchError:
-            return False
+    # 3. Create all tables
+    for db_name, engine in engines.items():
+        Base.metadata.create_all(engine)
+
+    # 4. Run migrations if needed
+    run_pending_migrations()
+
+    # 5. Initialize caches
+    warm_symbol_cache()
+    warm_api_key_cache()
 ```
 
-### 3. Data Validation
+### Migration Support
 
 ```python
-# SQLAlchemy validators
-from sqlalchemy.orm import validates
+def run_pending_migrations():
+    """Apply any pending database migrations"""
+    # Check current schema version
+    current_version = get_schema_version()
 
-class User(Base):
-    @validates('email')
-    def validate_email(self, key, email):
-        if '@' not in email:
-            raise ValueError("Invalid email address")
-        return email.lower()
-
-    @validates('username')
-    def validate_username(self, key, username):
-        if len(username) < 3:
-            raise ValueError("Username must be at least 3 characters")
-        return username
+    # Apply migrations sequentially
+    for migration in get_pending_migrations(current_version):
+        apply_migration(migration)
+        update_schema_version(migration.version)
 ```
 
-## Database Operations
+## Query Patterns
 
-### CRUD Operations
-
-```python
-# Create
-def create_user(username: str, email: str, password: str) -> User:
-    with get_db_session() as session:
-        user = User(
-            username=username,
-            email=email,
-            password_hash=hash_password(password)
-        )
-        session.add(user)
-        return user
-
-# Read
-def get_user_by_id(user_id: int) -> Optional[User]:
-    with get_db_session() as session:
-        return session.query(User).filter_by(id=user_id).first()
-
-# Update
-def update_user_email(user_id: int, new_email: str) -> bool:
-    with get_db_session() as session:
-        user = session.query(User).filter_by(id=user_id).first()
-        if user:
-            user.email = new_email
-            return True
-        return False
-
-# Delete
-def delete_user(user_id: int) -> bool:
-    with get_db_session() as session:
-        user = session.query(User).filter_by(id=user_id).first()
-        if user:
-            session.delete(user)
-            return True
-        return False
-```
-
-### Query Optimization
+### Optimized Queries
 
 ```python
-# Eager loading relationships
-def get_user_with_strategies(user_id: int):
-    with get_db_session() as session:
-        return session.query(User)\
-            .options(joinedload(User.strategies))\
-            .filter_by(id=user_id)\
-            .first()
+# Efficient symbol lookup with caching
+def get_symbol_token(symbol, exchange, broker):
+    cache_key = f"{broker}:{exchange}:{symbol}"
 
-# Bulk operations
-def bulk_insert_orders(orders: List[Dict]):
-    with get_db_session() as session:
-        session.bulk_insert_mappings(Order, orders)
+    if cache_key in symbol_cache:
+        return symbol_cache[cache_key]
 
-# Query with indexes
-def get_recent_orders(user_id: int, days: int = 7):
     with get_db_session() as session:
-        cutoff = datetime.now() - timedelta(days=days)
+        result = session.query(Symbol.token).filter(
+            Symbol.symbol == symbol,
+            Symbol.exchange == exchange,
+            Symbol.broker == broker
+        ).scalar()
+
+        symbol_cache[cache_key] = result
+        return result
+
+# Paginated order history
+def get_order_history(user_id, page=1, per_page=50):
+    with get_db_session() as session:
         return session.query(Order)\
             .filter(Order.user_id == user_id)\
-            .filter(Order.order_datetime > cutoff)\
-            .order_by(Order.order_datetime.desc())\
+            .order_by(Order.placed_at.desc())\
+            .offset((page - 1) * per_page)\
+            .limit(per_page)\
             .all()
 ```
 
-## Migration Management
-
-### Alembic Configuration
+### Aggregation Queries
 
 ```python
-# alembic.ini
-[alembic]
-script_location = migrations
-sqlalchemy.url = ${DATABASE_URL}
-
-# migrations/env.py
-from sqlalchemy import engine_from_config
-from alembic import context
-from database.models import Base
-
-target_metadata = Base.metadata
-
-def run_migrations_online():
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
-        prefix='sqlalchemy.',
-        poolclass=pool.NullPool,
-    )
-
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata
-        )
-
-        with context.begin_transaction():
-            context.run_migrations()
+# Daily P&L calculation
+def get_daily_pnl(user_id, date):
+    with get_db_session() as session:
+        return session.query(
+            func.sum(Trade.quantity * Trade.price).label('turnover'),
+            func.sum(case(
+                (Trade.action == 'SELL', Trade.quantity * Trade.price),
+                else_=-Trade.quantity * Trade.price
+            )).label('realized_pnl')
+        ).filter(
+            Trade.user_id == user_id,
+            func.date(Trade.traded_at) == date
+        ).first()
 ```
 
-### Migration Commands
+## Performance Considerations
+
+### Index Strategy
+
+```python
+# Composite indexes for common queries
+__table_args__ = (
+    Index('ix_orders_user_status', 'user_id', 'status'),
+    Index('ix_orders_symbol_date', 'symbol', 'placed_at'),
+    Index('ix_trades_user_date', 'user_id', 'traded_at'),
+)
+```
+
+### Connection Health
+
+```python
+# PostgreSQL connection health check
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,      # Verify connections before use
+    pool_recycle=1800,       # Recycle connections every 30 min
+)
+```
+
+### Read Replicas (Production)
+
+```python
+# Optional read replica configuration
+WRITE_DATABASE_URL = os.getenv('DATABASE_URL')
+READ_DATABASE_URL = os.getenv('READ_DATABASE_URL', WRITE_DATABASE_URL)
+
+def get_read_session():
+    """Get session for read-only operations"""
+    return Session(read_engine)
+
+def get_write_session():
+    """Get session for write operations"""
+    return Session(write_engine)
+```
+
+## Environment Configuration
 
 ```bash
-# Create new migration
-alembic revision --autogenerate -m "Add telegram tables"
+# SQLite (Development)
+DATABASE_URL=sqlite:///databases/openalgo.db
 
-# Apply migrations
-alembic upgrade head
+# PostgreSQL (Production)
+DATABASE_URL=postgresql://user:pass@localhost:5432/openalgo
+SANDBOX_DATABASE_URL=postgresql://user:pass@localhost:5432/openalgo_sandbox
+LATENCY_DATABASE_URL=postgresql://user:pass@localhost:5432/openalgo_latency
+LOGS_DATABASE_URL=postgresql://user:pass@localhost:5432/openalgo_logs
+TELEGRAM_DATABASE_URL=postgresql://user:pass@localhost:5432/openalgo_telegram
 
-# Rollback migration
-alembic downgrade -1
-
-# View migration history
-alembic history
+# Connection Pool Settings
+DB_POOL_SIZE=50
+DB_MAX_OVERFLOW=100
+DB_POOL_TIMEOUT=30
 ```
 
-## Performance Optimization
+## Related Documentation
 
-### 1. Indexing Strategy
-- Primary keys on all tables
-- Foreign key indexes for joins
-- Composite indexes for frequent queries
-- Covering indexes for read-heavy operations
-
-### 2. Connection Pooling
-- Base pool size: 50 connections
-- Max overflow: 100 connections
-- Connection recycling: 1 hour
-- Pre-ping for connection validation
-
-### 3. Query Optimization
-- Eager loading for relationships
-- Query result caching
-- Bulk operations for inserts/updates
-- Pagination for large result sets
-
-### 4. Database Maintenance
-- Regular VACUUM (SQLite)
-- Index statistics updates
-- Query performance monitoring
-- Slow query logging
-
-## Monitoring and Analytics
-
-### Database Metrics
-
-```python
-def get_database_statistics():
-    """Get database performance metrics"""
-    with get_db_session() as session:
-        stats = {
-            'total_users': session.query(User).count(),
-            'active_strategies': session.query(Strategy)\
-                .filter_by(status='RUNNING').count(),
-            'orders_today': session.query(Order)\
-                .filter(Order.order_datetime > datetime.today()).count(),
-            'active_connections': engine.pool.size(),
-            'overflow_connections': engine.pool.overflow()
-        }
-        return stats
-```
-
-### Query Performance Monitoring
-
-```python
-from sqlalchemy import event
-from sqlalchemy.engine import Engine
-import time
-
-@event.listens_for(Engine, "before_cursor_execute")
-def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-    conn.info.setdefault('query_start_time', []).append(time.time())
-
-@event.listens_for(Engine, "after_cursor_execute")
-def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-    total = time.time() - conn.info['query_start_time'].pop(-1)
-    if total > 1.0:  # Log slow queries (> 1 second)
-        logger.warning(f"Slow query ({total:.2f}s): {statement[:100]}")
-```
-
-## Backup and Recovery
-
-### Backup Strategy
-
-```python
-def backup_database():
-    """Create database backup"""
-    if 'sqlite' in DATABASE_URL:
-        # SQLite backup
-        import shutil
-        backup_path = f"backups/openalgo_{datetime.now():%Y%m%d_%H%M%S}.db"
-        shutil.copy2('openalgo.db', backup_path)
-    else:
-        # PostgreSQL/MySQL backup
-        os.system(f"pg_dump {DATABASE_URL} > backup.sql")
-```
-
-### Recovery Procedures
-
-```python
-def restore_database(backup_path: str):
-    """Restore database from backup"""
-    if 'sqlite' in DATABASE_URL:
-        import shutil
-        shutil.copy2(backup_path, 'openalgo.db')
-    else:
-        os.system(f"psql {DATABASE_URL} < {backup_path}")
-```
-
-## Future Enhancements
-
-### Planned Improvements
-1. **Time-series Database**: Integration for tick data
-2. **Read Replicas**: For scaling read operations
-3. **Sharding**: For horizontal scaling
-4. **Cache Layer**: Redis for frequently accessed data
-5. **Event Sourcing**: For audit trail
-6. **Data Archival**: Automatic old data archival
-
-## Conclusion
-
-The OpenAlgo database layer provides a robust, secure, and scalable foundation for the trading platform. With comprehensive models covering all aspects from user management to trading operations, encrypted storage for sensitive data, and optimized performance through connection pooling and indexing, it ensures reliable data persistence and retrieval for algorithmic trading operations.
+- [Authentication Platform](./06_authentication_platform.md) - Token encryption and API key management
+- [Broker Integration](./03_broker_integration.md) - Symbol mapping and token storage
+- [Logging System](./10_logging_system.md) - Database logging configuration
+- [Sandbox Architecture](./14_sandbox_architecture.md) - Paper trading database isolation

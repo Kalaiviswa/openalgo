@@ -68,6 +68,63 @@ class BrokerData:
         """Initialize Motilal Oswal data handler with authentication token"""
         self.auth_token = auth_token
         self._websocket = None
+        # Motilal does not support historical data with date ranges
+        # EOD API only returns current day's data, not historical ranges
+        self.timeframe_map = {}
+
+    def _detect_index_exchange(self, symbol: str) -> str:
+        """
+        Detect the specific index exchange (NSE_INDEX, BSE_INDEX, or MCX_INDEX) for an index symbol.
+
+        Args:
+            symbol: Index symbol (e.g., NIFTY, SENSEX, BANKEX)
+
+        Returns:
+            Specific index exchange (NSE_INDEX, BSE_INDEX, or MCX_INDEX)
+        """
+        # Common NSE indices
+        nse_indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT50']
+
+        # Common BSE indices
+        bse_indices = ['SENSEX', 'BANKEX', 'SENSEX50']
+
+        # Common MCX indices
+        mcx_indices = ['MCXMETLDEX', 'MCXENRGDEX']
+
+        symbol_upper = symbol.upper()
+
+        # Check if it's a known NSE index
+        if any(idx in symbol_upper for idx in nse_indices):
+            return 'NSE_INDEX'
+
+        # Check if it's a known BSE index
+        if any(idx in symbol_upper for idx in bse_indices):
+            return 'BSE_INDEX'
+
+        # Check if it's a known MCX index
+        if any(idx in symbol_upper for idx in mcx_indices):
+            return 'MCX_INDEX'
+
+        # Try database lookup
+        try:
+            from database.symbol import SymToken
+            from database.auth_db import db_session
+
+            with db_session() as session:
+                results = session.query(SymToken).filter(
+                    SymToken.symbol == symbol
+                ).all()
+
+                for result in results:
+                    if result.instrumenttype and 'INDEX' in result.instrumenttype.upper():
+                        logger.debug(f"Found index in database: {symbol} -> {result.instrumenttype}")
+                        return result.instrumenttype
+        except Exception as e:
+            logger.error(f"Error looking up index in database: {str(e)}")
+
+        # Default to NSE_INDEX for unknown indices
+        logger.warning(f"Could not determine specific index exchange for {symbol}, defaulting to NSE_INDEX")
+        return 'NSE_INDEX'
 
     def _auto_detect_exchange(self, symbol: str) -> str:
         """
@@ -131,7 +188,10 @@ class BrokerData:
         # Return existing connection if valid
         if not force_new and self._websocket:
             if hasattr(self._websocket, 'is_connected') and self._websocket.is_connected:
+                logger.debug("Using existing WebSocket connection")
                 return self._websocket
+            else:
+                logger.debug("Existing WebSocket not connected, creating new connection")
 
         # Get credentials from environment
         client_id = os.getenv("BROKER_API_KEY", "")
@@ -143,9 +203,26 @@ class BrokerData:
 
         # Connect and wait for authentication
         self._websocket.connect()
-        time.sleep(2)  # Wait for connection to establish
 
-        logger.debug("WebSocket connection established")
+        # Wait longer for connection to establish and authenticate
+        # Check connection status every 0.5 seconds for up to 5 seconds
+        max_wait = 5.0
+        wait_interval = 0.5
+        elapsed = 0
+
+        while elapsed < max_wait:
+            if self._websocket.is_connected:
+                logger.debug(f"WebSocket connection established after {elapsed:.1f} seconds")
+                return self._websocket
+            time.sleep(wait_interval)
+            elapsed += wait_interval
+
+        # Connection may still be establishing
+        if self._websocket.is_connected:
+            logger.info("WebSocket connection established")
+        else:
+            logger.warning("WebSocket connection status uncertain after timeout")
+
         return self._websocket
 
     def get_quotes(self, symbol: str, exchange: str) -> dict:
@@ -176,6 +253,15 @@ class BrokerData:
 
             if not token:
                 raise Exception(f"Token not found for symbol: {symbol}, exchange: {exchange}")
+
+            # Convert index exchanges to regular exchanges before API call
+            # Motilal API doesn't accept NSE_INDEX, it expects NSE
+            if exchange == 'NSE_INDEX':
+                exchange = 'NSE'
+            elif exchange == 'BSE_INDEX':
+                exchange = 'BSE'
+            elif exchange == 'MCX_INDEX':
+                exchange = 'MCX'
 
             # Map OpenAlgo exchange to Motilal exchange
             from broker.motilal.mapping.transform_data import map_exchange
@@ -229,72 +315,59 @@ class BrokerData:
             logger.error(f"Error fetching quotes for {symbol} on {exchange}: {str(e)}")
             raise Exception(f"Error fetching quotes: {str(e)}")
 
-    def _get_default_depth(self):
-        """Return default empty depth structure"""
-        return {
-            'bids': [],
-            'asks': [],
-            'totalbuyqty': 0,
-            'totalsellqty': 0
-        }
-
-    def get_market_depth(self, symbol_list, timeout: int = 5):
+    def get_multiquotes(self, symbols: list) -> list:
         """
-        Get market depth data for a list of symbols using the WebSocket connection.
-        This is the main implementation for market depth.
+        Get real-time quotes for multiple symbols using WebSocket
+        Motilal WebSocket supports subscribing to multiple instruments
 
         Args:
-            symbol_list: List of symbols, single symbol dict with exchange and symbol, or a single symbol string
-            timeout (int): Timeout in seconds
-
+            symbols: List of dicts with 'symbol' and 'exchange' keys
+                     Example: [{'symbol': 'SBIN', 'exchange': 'NSE'}, ...]
         Returns:
-            Dict with market depth data in the OpenAlgo standard format
+            list: List of quote data for each symbol with format:
+                  [{'symbol': 'SBIN', 'exchange': 'NSE', 'data': {...}}, ...]
         """
-        return self.get_depth(symbol_list, timeout)
+        try:
+            # Motilal WebSocket can handle multiple instruments
+            # Using batch size of 100 for practical response times
+            BATCH_SIZE = 100
+            RATE_LIMIT_DELAY = 0.1  # Delay between batches in seconds
 
-    def get_depth(self, symbol_list, timeout: int = 5):
+            if len(symbols) > BATCH_SIZE:
+                logger.info(f"Processing {len(symbols)} symbols in batches of {BATCH_SIZE}")
+                all_results = []
+
+                for i in range(0, len(symbols), BATCH_SIZE):
+                    batch = symbols[i:i + BATCH_SIZE]
+                    logger.debug(f"Processing batch {i//BATCH_SIZE + 1}: symbols {i+1} to {min(i+BATCH_SIZE, len(symbols))}")
+
+                    batch_results = self._process_multiquotes_batch(batch)
+                    all_results.extend(batch_results)
+
+                    # Rate limit delay between batches
+                    time.sleep(RATE_LIMIT_DELAY)
+
+                logger.info(f"Successfully processed {len(all_results)} quotes")
+                return all_results
+            else:
+                return self._process_multiquotes_batch(symbols)
+
+        except Exception as e:
+            logger.exception(f"Error fetching multiquotes")
+            raise Exception(f"Error fetching multiquotes: {e}")
+
+    def _process_multiquotes_batch(self, symbols: list) -> list:
         """
-        Get market depth data for a list of symbols using the WebSocket connection.
-        This follows the OpenAlgo standard structure.
-
+        Process a batch of symbols using WebSocket subscription
         Args:
-            symbol_list: List of symbols, single symbol dict with exchange and symbol, or a single symbol string
-            timeout (int): Timeout in seconds
-
+            symbols: List of dicts with 'symbol' and 'exchange' keys
         Returns:
-            Dict with market depth data in the OpenAlgo standard format
+            list: List of quote data for the batch
         """
-        logger.info(f"Getting market depth for: {symbol_list}")
-
-        # Standardize input format
-        # Handle dictionary input (single symbol case)
-        if isinstance(symbol_list, dict):
-            try:
-                # Extract symbol and exchange
-                symbol = symbol_list.get('symbol') or symbol_list.get('SYMBOL')
-                exchange = symbol_list.get('exchange') or symbol_list.get('EXCHANGE')
-
-                if symbol and exchange:
-                    logger.info(f"Processing single symbol depth request: {symbol} on {exchange}")
-                    # Convert to a list with a single item to use the standard flow
-                    symbol_list = [{'symbol': symbol, 'exchange': exchange}]
-                else:
-                    logger.error("Missing symbol or exchange in request")
-                    return {}
-            except Exception as e:
-                logger.error(f"Error processing single symbol depth request: {str(e)}")
-                return {}
-
-        # Handle plain string (like just "SBIN" or "GOLDPETAL28NOV25FUT")
-        elif isinstance(symbol_list, str):
-            symbol = symbol_list.strip()
-            # Use the helper function to auto-detect exchange based on database lookup
-            exchange = self._auto_detect_exchange(symbol)
-            logger.info(f"Processing string symbol depth: {symbol} on {exchange} (auto-detected)")
-            symbol_list = [{'symbol': symbol, 'exchange': exchange}]
-
-        # For simple case, prepare the instruments for WebSocket subscription
-        depth_data = []
+        results = []
+        skipped_symbols = []
+        registered_scrips = []  # Track registered scrips for unregistration
+        symbol_map = {}  # Map exchange:token to original symbol/exchange
 
         # Get WebSocket connection
         websocket = self.get_websocket()
@@ -304,145 +377,401 @@ class BrokerData:
             websocket = self.get_websocket(force_new=True)
 
         if not websocket or not websocket.is_connected:
-            logger.error("Could not establish WebSocket connection for market depth")
-            return {}
+            logger.error("Could not establish WebSocket connection")
+            raise ConnectionError("WebSocket connection unavailable")
 
-        # Process each symbol
-        for sym in symbol_list:
-            # If it's a simple dict with symbol and exchange
-            if isinstance(sym, dict) and 'symbol' in sym and 'exchange' in sym:
-                symbol = sym['symbol']
-                exchange = sym['exchange']
+        # Step 1: Prepare and register all instruments
+        for item in symbols:
+            symbol = item.get('symbol')
+            exchange = item.get('exchange')
 
+            if not symbol or not exchange:
+                logger.warning(f"Skipping entry due to missing symbol/exchange: {item}")
+                skipped_symbols.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'data': None,
+                    'error': 'Missing required symbol or exchange'
+                })
+                continue
+
+            try:
                 # Get token for this symbol
                 token = get_token(symbol, exchange)
+                if not token:
+                    logger.warning(f"Skipping symbol {symbol} on {exchange}: could not resolve token")
+                    skipped_symbols.append({
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'data': None,
+                        'error': 'Could not resolve token'
+                    })
+                    continue
 
-                if token:
-                    # Get broker symbol if different
-                    br_symbol = get_br_symbol(symbol, exchange) or symbol
+                # Map exchange for Motilal API
+                api_exchange = exchange
+                if exchange == 'NSE_INDEX':
+                    api_exchange = 'NSE'
+                elif exchange == 'BSE_INDEX':
+                    api_exchange = 'BSE'
+                elif exchange == 'MCX_INDEX':
+                    api_exchange = 'MCX'
 
-                    # Map OpenAlgo exchange to Motilal exchange
-                    from broker.motilal.mapping.transform_data import map_exchange
-                    motilal_exchange = map_exchange(exchange)
+                # Map OpenAlgo exchange to Motilal exchange
+                from broker.motilal.mapping.transform_data import map_exchange
+                motilal_exchange = map_exchange(api_exchange)
 
-                    # Determine exchange type (CASH or DERIVATIVES)
-                    exchange_type = "DERIVATIVES" if exchange in ['NFO', 'BFO', 'CDS', 'MCX'] else "CASH"
+                # Determine exchange type (CASH or DERIVATIVES)
+                exchange_type = "DERIVATIVES" if api_exchange in ['NFO', 'BFO', 'CDS', 'MCX'] else "CASH"
 
-                    logger.info(f"Subscribing to market depth for {exchange}:{symbol} with token {token}")
+                # Get broker symbol
+                br_symbol = get_br_symbol(symbol, exchange) or symbol
 
-                    # Subscribe to market depth
-                    success = websocket.register_scrip(motilal_exchange, exchange_type, int(token), br_symbol)
+                # Register scrip for market data
+                success = websocket.register_scrip(motilal_exchange, exchange_type, int(token), br_symbol)
 
-                    if success:
-                        # Wait for depth data to arrive
-                        logger.info(f"Waiting for WebSocket depth data for {exchange}:{symbol}")
-                        time.sleep(2.5)
+                if success:
+                    registered_scrips.append({
+                        'motilal_exchange': motilal_exchange,
+                        'exchange_type': exchange_type,
+                        'token': int(token)
+                    })
 
-                        # Retrieve depth from WebSocket
-                        depth = websocket.get_market_depth(motilal_exchange, token)
-
-                        if depth:
-                            # Create a normalized depth structure in the OpenAlgo format
-                            bids = depth.get('bids', [])
-                            asks = depth.get('asks', [])
-
-                            item = {
-                                'symbol': symbol,
-                                'exchange': exchange,
-                                'token': token,
-                                'timestamp': datetime.now().isoformat(),
-                                'total_buy_qty': sum(b.get('quantity', 0) for b in bids),
-                                'total_sell_qty': sum(a.get('quantity', 0) for a in asks),
-                                'ltp': 0,  # LTP not available in depth packet
-                                'oi': 0,   # OI not available in depth packet
-                                'depth': {
-                                    'buy': [],
-                                    'sell': []
-                                }
-                            }
-
-                            # Format the buy orders
-                            for bid in bids:
-                                item['depth']['buy'].append({
-                                    'price': bid.get('price', 0),
-                                    'quantity': bid.get('quantity', 0),
-                                    'orders': bid.get('orders', 0)
-                                })
-
-                            # Format the sell orders
-                            for ask in asks:
-                                item['depth']['sell'].append({
-                                    'price': ask.get('price', 0),
-                                    'quantity': ask.get('quantity', 0),
-                                    'orders': ask.get('orders', 0)
-                                })
-
-                            depth_data.append(item)
-                            logger.debug(f"Retrieved market depth for {symbol} on {exchange}")
-
-                            # Unsubscribe after getting the data to stop continuous streaming
-                            logger.info(f"Unsubscribing from depth for {exchange}:{symbol} after retrieving data")
-                            websocket.unregister_scrip(motilal_exchange, exchange_type, int(token))
-                        else:
-                            logger.warning(f"No market depth received for {symbol} on {exchange}")
-                            # Also unsubscribe even if no data received to clean up subscription
-                            logger.info(f"Unsubscribing from depth for {exchange}:{symbol} due to no data")
-                            websocket.unregister_scrip(motilal_exchange, exchange_type, int(token))
-                    else:
-                        logger.error(f"Failed to subscribe to market depth for {symbol} on {exchange}")
+                    # Store mapping for response processing
+                    key = f"{motilal_exchange}:{token}"
+                    symbol_map[key] = {
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'token': token
+                    }
                 else:
-                    logger.error(f"Could not find token for {symbol} on {exchange}")
+                    logger.warning(f"Failed to register {symbol} on {exchange}")
+                    skipped_symbols.append({
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'data': None,
+                        'error': 'Registration failed'
+                    })
+
+            except Exception as e:
+                logger.warning(f"Skipping symbol {symbol} on {exchange}: {str(e)}")
+                skipped_symbols.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'data': None,
+                    'error': str(e)
+                })
+                continue
+
+        if not registered_scrips:
+            logger.warning("No valid symbols to fetch quotes for")
+            return skipped_symbols
+
+        # Step 2: Wait for data to arrive
+        wait_time = min(max(len(registered_scrips) * 0.1, 2), 5)  # Between 2-5 seconds
+        logger.debug(f"Waiting {wait_time:.1f}s for quote data...")
+        time.sleep(wait_time)
+
+        # Step 3: Collect results from WebSocket
+        for key, info in symbol_map.items():
+            motilal_exchange, token = key.split(':')
+
+            quote = websocket.get_quote(motilal_exchange, token)
+
+            if quote:
+                results.append({
+                    'symbol': info['symbol'],
+                    'exchange': info['exchange'],
+                    'data': {
+                        'bid': float(quote.get('bid', 0)),
+                        'ask': float(quote.get('ask', 0)),
+                        'open': float(quote.get('open', 0)),
+                        'high': float(quote.get('high', 0)),
+                        'low': float(quote.get('low', 0)),
+                        'ltp': float(quote.get('ltp', 0)),
+                        'prev_close': float(quote.get('prev_close', 0)),
+                        'volume': int(quote.get('volume', 0)),
+                        'oi': int(quote.get('open_interest', 0))
+                    }
+                })
             else:
-                logger.warning(f"Unsupported symbol format for market depth: {sym}")
+                results.append({
+                    'symbol': info['symbol'],
+                    'exchange': info['exchange'],
+                    'error': 'No data received'
+                })
 
-        # Return data directly (service layer will wrap it)
-        # If there's no data, return empty response
-        if not depth_data:
-            return {}
+        # Step 4: Unregister all scrips after getting data
+        logger.info(f"Unregistering {len(registered_scrips)} scrips")
+        for scrip in registered_scrips:
+            try:
+                websocket.unregister_scrip(
+                    scrip['motilal_exchange'],
+                    scrip['exchange_type'],
+                    scrip['token']
+                )
+            except Exception as e:
+                logger.warning(f"Error unregistering scrip: {e}")
 
-        # For single symbol request (most common case), return in simplified format
-        if len(depth_data) == 1:
-            # Extract the first and only depth item
-            depth_item = depth_data[0]
+        logger.info(f"Retrieved quotes for {len([r for r in results if 'data' in r])}/{len(symbol_map)} symbols")
+        return skipped_symbols + results
 
-            # Return the data directly without wrapping
+    def _get_default_depth(self):
+        """Return default empty depth structure"""
+        return {
+            'bids': [],
+            'asks': [],
+            'totalbuyqty': 0,
+            'totalsellqty': 0
+        }
+
+    def get_depth(self, symbol: str, exchange: str) -> dict:
+        """
+        Get market depth for given symbol from Motilal Oswal using WebSocket.
+        This follows the OpenAlgo standard structure matching Angel and other brokers.
+
+        Args:
+            symbol: Trading symbol (e.g., SBIN, NIFTY)
+            exchange: Exchange (e.g., NSE, BSE, NFO, NSE_INDEX)
+
+        Returns:
+            dict: Market depth data in OpenAlgo standard format
+        """
+        logger.info(f"Getting market depth for: {symbol} on {exchange}")
+
+        # Handle generic 'INDEX' exchange by detecting specific index exchange
+        if exchange == 'INDEX':
+            exchange = self._detect_index_exchange(symbol)
+            logger.debug(f"Converted generic INDEX to {exchange} for {symbol}")
+
+        # Get WebSocket connection with retry logic
+        websocket = None
+        max_retries = 3
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                websocket = self.get_websocket()
+
+                if websocket and websocket.is_connected:
+                    logger.debug(f"WebSocket connected on attempt {retry_count + 1}")
+                    break
+
+                logger.warning(f"WebSocket not connected on attempt {retry_count + 1}, retrying...")
+
+                # Force new connection on retry
+                websocket = self.get_websocket(force_new=True)
+
+                # Wait a bit longer for connection to establish
+                time.sleep(2)
+
+                if websocket and websocket.is_connected:
+                    logger.debug(f"WebSocket connected after retry {retry_count + 1}")
+                    break
+
+                retry_count += 1
+
+            except Exception as e:
+                logger.error(f"WebSocket connection attempt {retry_count + 1} failed: {str(e)}")
+                retry_count += 1
+                time.sleep(1)
+
+        if not websocket or not websocket.is_connected:
+            logger.error(f"Could not establish WebSocket connection after {max_retries} attempts")
+            # Return empty depth data instead of throwing error
             return {
-                "symbol": depth_item.get('symbol', ''),
-                "exchange": depth_item.get('exchange', ''),
-                "ltp": depth_item.get('ltp', 0),
-                "oi": depth_item.get('oi', 0),
-                "total_buy_qty": depth_item.get('total_buy_qty', 0),
-                "total_sell_qty": depth_item.get('total_sell_qty', 0),
-                "depth": depth_item.get('depth', {'buy': [], 'sell': []})
+                'bids': [{'price': 0, 'quantity': 0}] * 5,
+                'asks': [{'price': 0, 'quantity': 0}] * 5,
+                'high': 0,
+                'low': 0,
+                'ltp': 0,
+                'ltq': 0,
+                'open': 0,
+                'prev_close': 0,
+                'volume': 0,
+                'oi': 0,
+                'totalbuyqty': 0,
+                'totalsellqty': 0
             }
 
-        # For multiple symbols, return as list
-        return {"data": depth_data}
+        try:
+            # Get token for this symbol
+            token = get_token(symbol, exchange)
+
+            if not token:
+                raise Exception(f"Token not found for symbol: {symbol}, exchange: {exchange}")
+
+            # Get broker symbol if different
+            br_symbol = get_br_symbol(symbol, exchange) or symbol
+
+            # Convert index exchanges to regular exchanges before API call
+            # Motilal API doesn't accept NSE_INDEX, it expects NSE
+            api_exchange = exchange
+            if api_exchange == 'NSE_INDEX':
+                api_exchange = 'NSE'
+            elif api_exchange == 'BSE_INDEX':
+                api_exchange = 'BSE'
+            elif api_exchange == 'MCX_INDEX':
+                api_exchange = 'MCX'
+
+            # Map OpenAlgo exchange to Motilal exchange
+            from broker.motilal.mapping.transform_data import map_exchange
+            motilal_exchange = map_exchange(api_exchange)
+
+            # Determine exchange type (CASH or DERIVATIVES)
+            exchange_type = "DERIVATIVES" if api_exchange in ['NFO', 'BFO', 'CDS', 'MCX'] else "CASH"
+
+            logger.info(f"Subscribing to market depth for {exchange}:{symbol} with token {token}")
+
+            # Subscribe to market depth
+            success = websocket.register_scrip(motilal_exchange, exchange_type, int(token), br_symbol)
+
+            if not success:
+                raise Exception(f"Failed to subscribe to market depth for {symbol} on {exchange}")
+
+            # Wait for depth data to arrive
+            # NOTE: Motilal's WebSocket broadcast feed typically only provides depth level 1 (best bid/ask)
+            # Levels 2-5 may not be sent via WebSocket depending on subscription type
+            logger.debug(f"Waiting for WebSocket depth data for {exchange}:{symbol}")
+            logger.warning("⚠️ Motilal may only provide depth level 1 (best bid/ask) via WebSocket")
+
+            # Wait for depth data to arrive (increased time for potential multiple levels)
+            time.sleep(3.0)
+
+            # Retrieve depth (may contain 1-5 levels depending on broker feed)
+            depth = websocket.get_market_depth(motilal_exchange, token)
+
+            # Log what we actually received
+            if depth:
+                bids_count = len([b for b in depth.get('bids', []) if b and b.get('price', 0) > 0])
+                asks_count = len([a for a in depth.get('asks', []) if a and a.get('price', 0) > 0])
+                logger.debug(f"📊 Received {bids_count} bid levels and {asks_count} ask levels for {symbol}")
+            else:
+                logger.warning(f"❌ No depth data received for {symbol}")
+
+            # Also try to get quote data (OHLC, LTP, volume) for this symbol
+            quote = websocket.get_quote(motilal_exchange, token)
+
+            # Unsubscribe after getting the data to stop continuous streaming
+            logger.info(f"Unsubscribing from depth for {exchange}:{symbol} after retrieving data")
+            websocket.unregister_scrip(motilal_exchange, exchange_type, int(token))
+
+            # Create a normalized depth structure in the OpenAlgo format
+            # If depth is not available (e.g., for indices), use empty lists
+            if depth:
+                bids = depth.get('bids', [])
+                asks = depth.get('asks', [])
+            else:
+                logger.warning(f"No market depth data available for {symbol} on {exchange}, using empty depth")
+                bids = []
+                asks = []
+
+            # Extract quote data if available
+            ltp = quote.get('ltp', 0) if quote else 0
+            oi = 0  # OI comes separately from quote
+            high = quote.get('high', 0) if quote else 0
+            low = quote.get('low', 0) if quote else 0
+            open_price = quote.get('open', 0) if quote else 0
+            prev_close = quote.get('prev_close', 0) if quote else 0
+            volume = quote.get('volume', 0) if quote else 0
+
+            # Format bids and asks - ensure exactly 5 entries each (matching Angel format)
+            formatted_bids = []
+            formatted_asks = []
+
+            # Process buy orders (ensure 5 entries)
+            for i in range(5):
+                if i < len(bids) and bids[i] is not None:
+                    formatted_bids.append({
+                        'price': bids[i].get('price', 0),
+                        'quantity': bids[i].get('quantity', 0)
+                    })
+                else:
+                    formatted_bids.append({'price': 0, 'quantity': 0})
+
+            # Process sell orders (ensure 5 entries)
+            for i in range(5):
+                if i < len(asks) and asks[i] is not None:
+                    formatted_asks.append({
+                        'price': asks[i].get('price', 0),
+                        'quantity': asks[i].get('quantity', 0)
+                    })
+                else:
+                    formatted_asks.append({'price': 0, 'quantity': 0})
+
+            # Calculate total buy and sell quantities
+            total_buy_qty = sum(b.get('quantity', 0) for b in bids if b is not None)
+            total_sell_qty = sum(a.get('quantity', 0) for a in asks if a is not None)
+
+            # Return in Angel's OpenAlgo standard format (matching lines 524-537 of angel/api/data.py)
+            return {
+                'bids': formatted_bids,
+                'asks': formatted_asks,
+                'high': high,
+                'low': low,
+                'ltp': ltp,
+                'ltq': 0,  # Last traded quantity not available in Motilal depth data
+                'open': open_price,
+                'prev_close': prev_close,
+                'volume': volume,
+                'oi': oi,
+                'totalbuyqty': total_buy_qty,
+                'totalsellqty': total_sell_qty
+            }
+
+        except Exception as e:
+            logger.error(f"Error fetching market depth for {symbol} on {exchange}: {str(e)}")
+            # Return empty depth data instead of throwing error
+            return {
+                'bids': [{'price': 0, 'quantity': 0}] * 5,
+                'asks': [{'price': 0, 'quantity': 0}] * 5,
+                'high': 0,
+                'low': 0,
+                'ltp': 0,
+                'ltq': 0,
+                'open': 0,
+                'prev_close': 0,
+                'volume': 0,
+                'oi': 0,
+                'totalbuyqty': 0,
+                'totalsellqty': 0
+            }
 
     def get_history(self, symbol: str, exchange: str, interval: str,
                    start_date: str, end_date: str) -> pd.DataFrame:
         """
-        Get historical data for given symbol.
-
-        Note: Motilal Oswal does NOT provide historical candle data via REST API.
-
+        Get historical data for given symbol and timeframe
         Args:
             symbol: Trading symbol
-            exchange: Exchange (e.g., NSE, BSE, NFO, BFO, CDS, MCX)
-            interval: Candle interval (1m, 3m, 5m, 10m, 15m, 30m, 1h, D)
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
+            exchange: Exchange (e.g., NSE, BSE)
+            interval: Time interval (e.g., 1m, 5m, 15m, 60m, D)
+            start_date: Start date in format YYYY-MM-DD
+            end_date: End date in format YYYY-MM-DD
+        Returns:
+            pd.DataFrame: Empty DataFrame (historical data not supported)
+        """
+        logger.info(f"Historical data not provided by Motilal Oswal for {symbol}")
+        # Return empty DataFrame with expected columns
+        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+
+    def get_intervals(self) -> list:
+        """Get available intervals/timeframes for historical data
 
         Returns:
-            pd.DataFrame: Empty dataframe
-
-        Raises:
-            Exception: Always raises exception as historical data is not supported
+            list: Empty list (historical data not supported)
         """
-        error_msg = (
-            "Historical candle data is not available via REST API for Motilal Oswal. "
-            "Motilal provides EOD (End of Day) data only. "
-            "For intraday historical data, you may need to use third-party data providers."
-        )
-        logger.warning(f"History API called for {symbol} on {exchange}, but not supported")
-        raise Exception(error_msg)
+        logger.info("Historical data intervals not provided by Motilal Oswal")
+        return []
+
+    def get_supported_intervals(self) -> dict:
+        """Return supported intervals matching the format expected by intervals.py"""
+        intervals = {
+            'seconds': [],
+            'minutes': [],
+            'hours': [],
+            'days': [],
+            'weeks': [],
+            'months': []
+        }
+        logger.warning("Motilal Oswal does not support historical data intervals")
+        return intervals

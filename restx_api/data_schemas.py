@@ -108,6 +108,7 @@ class OptionGreeksSchema(Schema):
     symbol = fields.Str(required=True)      # Option symbol (e.g., NIFTY28NOV2424000CE)
     exchange = fields.Str(required=True, validate=validate.OneOf(["NFO", "BFO", "CDS", "MCX"]))  # Exchange (NFO, BFO, CDS, MCX)
     interest_rate = fields.Float(required=False, validate=validate.Range(min=0, max=100))  # Risk-free interest rate (annualized %). Optional, defaults per exchange
+    forward_price = fields.Float(required=False, validate=validate.Range(min=0))  # Optional: Custom forward/synthetic futures price. If provided, skips underlying price fetch
     underlying_symbol = fields.Str(required=False)   # Optional: Specify underlying symbol (e.g., NIFTY or NIFTY28NOV24FUT)
     underlying_exchange = fields.Str(required=False)  # Optional: Specify underlying exchange (NSE_INDEX, NFO, etc.)
     expiry_time = fields.Str(required=False)  # Optional: Custom expiry time in HH:MM format (e.g., "15:30", "19:00"). If not provided, uses exchange defaults
@@ -118,3 +119,10 @@ class InstrumentsSchema(Schema):
         "NSE", "BSE", "NFO", "BFO", "BCD", "CDS", "MCX", "NSE_INDEX", "BSE_INDEX"
     ]))  # Optional exchange filter
     format = fields.Str(required=False, validate=validate.OneOf(["json", "csv"]))  # Output format (json or csv), defaults to json
+
+class OptionChainSchema(Schema):
+    apikey = fields.Str(required=True)      # API Key for authentication
+    underlying = fields.Str(required=True)  # Underlying symbol (e.g., NIFTY, BANKNIFTY, RELIANCE)
+    exchange = fields.Str(required=True)    # Exchange (NSE_INDEX, NSE, NFO, BSE_INDEX, BSE, BFO, MCX, CDS)
+    expiry_date = fields.Str(required=True)  # Expiry date in DDMMMYY format (e.g., 28NOV25) - MANDATORY
+    strike_count = fields.Int(required=False, validate=validate.Range(min=1, max=100), allow_none=True)  # Number of strikes above/below ATM. If not provided, returns entire chain

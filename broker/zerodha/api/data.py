@@ -51,14 +51,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
         'Content-Type': 'application/json'
     }
     
-    # For GET requests, include params in URL
-    params = {}
-    if method.upper() == 'GET' and '?' in endpoint:
-        # Extract query params from endpoint
-        path, query = endpoint.split('?', 1)
-        params = dict(urllib.parse.parse_qsl(query))
-        endpoint = path
-    
+    # Keep query params in URL to preserve duplicate keys (e.g., multiple i= for quotes)
     url = f"{base_url}{endpoint}"
     
     try:
@@ -69,22 +62,18 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
         #logger.info(f"Headers: {json.dumps(headers, indent=2)}")
         if payload:
             logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
-        if params:
-            logger.debug(f"Params: {json.dumps(params, indent=2)}")
         
         # Make the request using the shared client
         if method.upper() == 'GET':
             response = client.get(
                 url,
-                headers=headers,
-                params=params
+                headers=headers
             )
         elif method.upper() == 'POST':
             headers['Content-Type'] = 'application/json'
             response = client.post(
                 url,
                 headers=headers,
-                params=params,
                 json=payload
             )
         else:
@@ -264,6 +253,7 @@ class BrokerData:
         """
         try:
             BATCH_SIZE = 500  # Zerodha API limit per request
+            RATE_LIMIT_DELAY = 1.0  # 1 request per second = 500 symbols/second
 
             # If symbols exceed batch size, process in batches
             if len(symbols) > BATCH_SIZE:
@@ -279,9 +269,9 @@ class BrokerData:
                     batch_results = self._process_quotes_batch(batch)
                     all_results.extend(batch_results)
 
-                    # Small delay between batches to avoid rate limiting
+                    # Rate limit delay between batches
                     if i + BATCH_SIZE < len(symbols):
-                        time.sleep(0.1)
+                        time.sleep(RATE_LIMIT_DELAY)
 
                 logger.info(f"Successfully processed {len(all_results)} quotes in {(len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE} batches")
                 return all_results
@@ -307,11 +297,23 @@ class BrokerData:
         # Build list of exchange:symbol pairs and symbol map
         instruments = []
         symbol_map = {}  # Map "exchange:br_symbol" to original symbol/exchange
+        skipped_symbols = []  # Track symbols that couldn't be resolved
 
         for item in symbols:
             symbol = item['symbol']
             exchange = item['exchange']
             br_symbol = get_br_symbol(symbol, exchange)
+            logger.info(f"Symbol mapping: {symbol}@{exchange} -> br_symbol={br_symbol}")
+
+            # Track symbols that couldn't be resolved
+            if not br_symbol:
+                logger.warning(f"Skipping symbol {symbol} on {exchange}: could not resolve broker symbol")
+                skipped_symbols.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'error': 'Could not resolve broker symbol'
+                })
+                continue
 
             # Normalize exchange for indices
             api_exchange = exchange
@@ -328,6 +330,11 @@ class BrokerData:
                 'br_symbol': br_symbol,
                 'api_exchange': api_exchange
             }
+
+        # Return skipped symbols if no valid instruments
+        if not instruments:
+            logger.warning("No valid instruments to fetch quotes for")
+            return skipped_symbols
 
         # Build query string with multiple 'i' parameters
         # Format: /quote?i=NSE:SBIN&i=NSE:TCS&i=BSE:INFY
@@ -381,7 +388,8 @@ class BrokerData:
             }
             results.append(result_item)
 
-        return results
+        # Include skipped symbols in results
+        return skipped_symbols + results
 
     def get_history(self, symbol: str, exchange: str, timeframe: str, from_date: str, to_date: str) -> pd.DataFrame:
         """
