@@ -50,7 +50,7 @@ generate_hex() {
 # Function to validate broker name
 validate_broker() {
     local broker=$1
-    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,kotak,motilal,mstock,paytm,pocketful,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
+    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
 
     if [[ $valid_brokers == *"$broker"* ]]; then
         return 0
@@ -62,7 +62,7 @@ validate_broker() {
 # Function to check if broker is XTS based
 is_xts_broker() {
     local broker=$1
-    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,wisdom"
+    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,wisdom"
     if [[ $xts_brokers == *"$broker"* ]]; then
         return 0
     else
@@ -152,7 +152,7 @@ for ((i=1; i<=INSTANCES; i++)); do
 
     # Get broker
     while true; do
-        log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,kotak,motilal,paytm,pocketful,shoonya,tradejini,upstox,wisdom,zebu,zerodha,mstock" "$BLUE"
+        log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha" "$BLUE"
         read -p "Enter broker name for instance $i: " broker
         if validate_broker "$broker"; then
             BROKERS+=("$broker")
@@ -354,8 +354,15 @@ for ((i=1; i<=INSTANCES; i++)); do
     log_message "Setting permissions..." "$BLUE"
     sudo mkdir -p "$INSTANCE_DIR/db"
     sudo mkdir -p "$INSTANCE_DIR/tmp"
+    # Create directories for Python strategy feature
+    sudo mkdir -p "$INSTANCE_DIR/strategies/scripts"
+    sudo mkdir -p "$INSTANCE_DIR/strategies/examples"
+    sudo mkdir -p "$INSTANCE_DIR/log/strategies"
+    sudo mkdir -p "$INSTANCE_DIR/keys"
     sudo chown -R www-data:www-data "$INSTANCE_DIR"
     sudo chmod -R 755 "$INSTANCE_DIR"
+    # Set more restrictive permissions for sensitive directories
+    sudo chmod 700 "$INSTANCE_DIR/keys"
     [ -S "$SOCKET_FILE" ] && sudo rm -f "$SOCKET_FILE"
 
     # Configure Nginx (initial for SSL)

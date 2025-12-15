@@ -299,6 +299,14 @@ def broker_callback(broker,para=None):
         auth_token, feed_token, user_id, error_message = auth_function(code)
         forward_url = 'broker.html'
 
+    elif broker=='jainamxts':
+        code = 'jainamxts'
+        logger.debug(f'JainamXTS broker - code: {code}')  
+               
+        # Fetch auth token, feed token and user ID
+        auth_token, feed_token, user_id, error_message = auth_function(code)
+        forward_url = 'broker.html'
+
     elif broker=='dhan':
         auth_token = None
         error_message = None
@@ -443,6 +451,16 @@ def broker_callback(broker,para=None):
 
             auth_token, error_message = auth_function(userid, password, totp_code)
             forward_url = 'firstock.html'
+
+    elif broker == 'samco':
+        if request.method == 'GET':
+            return render_template('samco.html')
+
+        elif request.method == 'POST':
+            yob = request.form.get('yob')
+
+            auth_token, error_message = auth_function(yob)
+            forward_url = 'samco.html'
 
     elif broker == 'motilal':
         if request.method == 'GET':

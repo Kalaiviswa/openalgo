@@ -42,14 +42,14 @@ generate_hex() {
 # Function to validate broker
 validate_broker() {
     local broker=$1
-    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,kotak,motilal,mstock,paytm,pocketful,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
+    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
     [[ $valid_brokers == *"$broker"* ]]
 }
 
 # Function to check if broker is XTS based
 is_xts_broker() {
     local broker=$1
-    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,wisdom"
+    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,wisdom"
     [[ $xts_brokers == *"$broker"* ]]
 }
 
@@ -115,8 +115,8 @@ while true; do
     log "\nValid brokers:" "$BLUE"
     echo "fivepaisa, fivepaisaxts, aliceblue, angel, compositedge, definedge,"
     echo "dhan, dhan_sandbox, firstock, flattrade, fyers, groww, ibulls, iifl,"
-    echo "indmoney, kotak, motilal, paytm, pocketful, shoonya, tradejini,"
-    echo "upstox, wisdom, zebu, zerodha, mstock"
+    echo "indmoney, jainamxts, kotak, motilal, mstock, paytm, pocketful,"
+    echo "samco, shoonya, tradejini, upstox, wisdom, zebu, zerodha,"
     echo ""
     read -p "Enter your broker name: " BROKER_NAME
     if validate_broker "$BROKER_NAME"; then
@@ -243,8 +243,10 @@ cd $INSTALL_PATH
 
 # Create required directories
 log "\n=== Creating Required Directories ===" "$BLUE"
-$SUDO mkdir -p log logs keys db strategies/scripts
-$SUDO chown -R 1000:1000 log logs
+$SUDO mkdir -p log logs keys db strategies/scripts strategies/examples
+$SUDO chown -R 1000:1000 log logs strategies
+$SUDO chmod -R 755 strategies log
+$SUDO chmod 700 keys
 check_status "Directory creation failed"
 
 # Configure environment file
@@ -286,16 +288,18 @@ services:
       dockerfile: Dockerfile
 
     container_name: openalgo-web
-    
+
     ports:
       - "127.0.0.1:5000:5000"
       - "127.0.0.1:8765:8765"
 
+    # Use named volumes to avoid permission issues with non-root container user
     volumes:
       - openalgo_db:/app/db
-      - ./log:/app/log
-      - ./logs:/app/logs
-      - ./strategies:/app/strategies
+      - openalgo_logs:/app/logs
+      - openalgo_log:/app/log
+      - openalgo_strategies:/app/strategies
+      - openalgo_keys:/app/keys
       - ./.env:/app/.env:ro
 
     environment:
@@ -312,8 +316,17 @@ services:
 
     restart: unless-stopped
 
+# Named volumes for data persistence with proper permissions
 volumes:
   openalgo_db:
+    driver: local
+  openalgo_logs:
+    driver: local
+  openalgo_log:
+    driver: local
+  openalgo_strategies:
+    driver: local
+  openalgo_keys:
     driver: local
 EOF
 
@@ -646,10 +659,28 @@ BACKUP_FILE="$BACKUP_DIR/openalgo_backup_$TIMESTAMP.tar.gz"
 mkdir -p $BACKUP_DIR
 echo "Creating backup..."
 cd /opt/openalgo
+
+# Backup .env file and Docker volume data
+echo "Backing up configuration and volume data..."
 sudo docker compose stop
-sudo tar -czf $BACKUP_FILE --exclude='log/*' --exclude='logs/*' db .env strategies 2>/dev/null
+
+# Create temp directory for volume exports
+TEMP_DIR=$(mktemp -d)
+
+# Export data from Docker volumes
+sudo docker run --rm -v openalgo_db:/data -v $TEMP_DIR:/backup alpine tar -czf /backup/db.tar.gz -C /data . 2>/dev/null
+sudo docker run --rm -v openalgo_strategies:/data -v $TEMP_DIR:/backup alpine tar -czf /backup/strategies.tar.gz -C /data . 2>/dev/null
+
+# Create final backup
+sudo tar -czf $BACKUP_FILE .env -C $TEMP_DIR db.tar.gz strategies.tar.gz 2>/dev/null
+
+# Cleanup temp directory
+sudo rm -rf $TEMP_DIR
+
 sudo docker compose start
 echo "Backup created: $BACKUP_FILE"
+
+# Keep only last 7 backups
 cd $BACKUP_DIR
 ls -t openalgo_backup_*.tar.gz 2>/dev/null | tail -n +8 | xargs -r rm
 echo "Backup completed!"
