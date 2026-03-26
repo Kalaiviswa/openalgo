@@ -75,19 +75,21 @@ def transform_data(data, token, auth_token=None):
                         f"FinalPrice={protected_price}"
                     )
                 else:
-                    logger.warning(
-                        f"MPP Warning: LTP is 0 or invalid for Symbol={data['symbol']}, "
-                        f"Exchange={data['exchange']}. Proceeding with regular market order"
+                    raise ValueError(
+                        f"MPP failed: LTP is 0 or invalid for {data['symbol']} on {data['exchange']}. "
+                        f"Cannot place MARKET order (blocked by Zebu API)."
                     )
             else:
-                logger.warning(
-                    f"MPP Warning: No auth token available for Symbol={data['symbol']}. "
-                    f"Cannot fetch quotes for MPP adjustment"
+                raise ValueError(
+                    f"MPP failed: No auth token available for {data['symbol']}. "
+                    f"Cannot place MARKET order (blocked by Zebu API)."
                 )
+        except ValueError:
+            raise  # Re-raise MPP validation errors
         except Exception as e:
-            logger.error(
-                f"MPP Error: Failed to apply MPP for Symbol={data['symbol']}, "
-                f"Exchange={data['exchange']}, Error={str(e)}. Proceeding with regular market order."
+            raise ValueError(
+                f"MPP failed for {data['symbol']} on {data['exchange']}: {str(e)}. "
+                f"Cannot place MARKET order (blocked by Zebu API)."
             )
 
     # Basic mapping

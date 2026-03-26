@@ -440,7 +440,7 @@ def broker_callback(broker, para=None):
     elif broker == "zebu":
         code = request.args.get("code")
         if code:
-            logger.debug(f"Zebu broker - OAuth callback with code: {code}")
+            logger.debug("Zebu broker - OAuth callback received")
             auth_token, error_message = auth_function(code)
             forward_url = "broker.html"
         else:
@@ -453,7 +453,13 @@ def broker_callback(broker, para=None):
                     "BROKER_API_KEY not configured in environment",
                     forward_url="broker.html",
                 )
-            client_id = full_api_key.split(":::")[1]  # OAuth client_id
+            parts = full_api_key.split(":::", 1)
+            if len(parts) != 2 or not parts[1]:
+                return handle_auth_failure(
+                    "BROKER_API_KEY must be in format userid:::client_id",
+                    forward_url="broker.html",
+                )
+            client_id = parts[1]  # OAuth client_id
             zebu_login_url = f"https://go.mynt.in/OAuthlogin/authorize/oauth?client_id={client_id}"
             return redirect(zebu_login_url)
 

@@ -13,12 +13,13 @@ def authenticate_broker(code):
     Authenticate with Zebu using OAuth 2.0 flow.
     Exchanges the authorization code for an access token.
     """
-    # BROKER_API_KEY format: userid:::client_id (e.g., Z56004:::Z56004_U)
-    full_api_key = os.getenv("BROKER_API_KEY")
-    client_id = full_api_key.split(":::")[1]  # OAuth client_id
-    secret_key = os.getenv("BROKER_API_SECRET")
-
     try:
+        # BROKER_API_KEY format: userid:::client_id (e.g., Z56004:::Z56004_U)
+        full_api_key = os.getenv("BROKER_API_KEY")
+        if not full_api_key or ":::" not in full_api_key:
+            return None, "BROKER_API_KEY must be in format userid:::client_id"
+        client_id = full_api_key.split(":::")[1]  # OAuth client_id
+        secret_key = os.getenv("BROKER_API_SECRET")
         # Get the shared httpx client
         client = get_httpx_client()
 
