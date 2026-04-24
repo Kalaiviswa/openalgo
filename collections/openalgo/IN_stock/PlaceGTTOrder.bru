@@ -1,0 +1,32 @@
+meta {
+  name: PlaceGTTOrder
+  type: http
+  seq: 64
+}
+
+post {
+  url: http://127.0.0.1:5000/api/v1/placegttorder
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+      "apikey": "a85992a13ab7db424c239c50826116366e9f4fd8c591345a2d23aad01ffa4d00",
+      "strategy": "My GTT Strategy",
+      "exchange": "NSE",
+      "symbol": "RELIANCE",
+      "trigger_type": "single",
+      "trigger_prices": [2500.0],
+      "last_price": 2550.0,
+      "legs": [
+          {
+              "action": "BUY",
+              "quantity": 1,
+              "price": 2500.0,
+              "pricetype": "LIMIT",
+              "product": "CNC"
+          }
+      ]
+  }
+}

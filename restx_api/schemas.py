@@ -347,3 +347,147 @@ class MarginCalculatorSchema(Schema):
         required=True,
         validate=validate.Length(min=1, max=50, error="Positions must contain 1 to 50 items."),
     )
+
+
+# -----------------------------------------------------------------------------
+# GTT (Good Till Triggered) Schemas
+# -----------------------------------------------------------------------------
+
+VALID_GTT_TRIGGER_TYPES = ["single", "two-leg"]
+
+
+class GTTLegSchema(Schema):
+    """Schema for a single GTT leg (one order that fires when its trigger is hit)."""
+
+    action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
+    quantity = fields.Float(
+        required=True,
+        validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number."),
+    )
+    price = fields.Float(
+        required=True, validate=validate.Range(min=0, error="Price must be a non-negative number.")
+    )
+    # Most brokers (Zerodha incl.) only support LIMIT for GTT legs.
+    pricetype = fields.Str(missing="LIMIT", validate=validate.OneOf(["LIMIT", "MARKET"]))
+    product = fields.Str(required=True, validate=validate.OneOf(["MIS", "NRML", "CNC"]))
+
+    @post_load
+    def normalise(self, data, **kwargs):
+        data["action"] = data["action"].upper()
+        return data
+
+
+def _validate_gtt_legs(data):
+    """Enforce the single vs two-leg rules and quantity coercion across all legs."""
+    trigger_type = data.get("trigger_type")
+    trigger_prices = data.get("trigger_prices") or []
+    legs = data.get("legs") or []
+
+    if trigger_type == "single":
+        if len(trigger_prices) != 1:
+            raise ValidationError(
+                {"trigger_prices": ["Single-trigger GTT requires exactly 1 trigger price."]}
+            )
+        if len(legs) != 1:
+            raise ValidationError({"legs": ["Single-trigger GTT requires exactly 1 leg."]})
+    elif trigger_type == "two-leg":
+        if len(trigger_prices) != 2:
+            raise ValidationError(
+                {"trigger_prices": ["Two-leg (OCO) GTT requires exactly 2 trigger prices."]}
+            )
+        if len(legs) != 2:
+            raise ValidationError({"legs": ["Two-leg (OCO) GTT requires exactly 2 legs."]})
+
+    # Coerce each leg's quantity to int for non-crypto exchanges (broker parity).
+    exchange = data.get("exchange")
+    if exchange and exchange not in CRYPTO_EXCHANGES:
+        for i, leg in enumerate(legs):
+            qty = leg.get("quantity")
+            if qty is None:
+                continue
+            if qty != int(qty):
+                raise ValidationError(
+                    {
+                        "legs": {
+                            i: {
+                                "quantity": [
+                                    f"Fractional quantity ({qty}) is not allowed for non-crypto exchanges."
+                                ]
+                            }
+                        }
+                    }
+                )
+            leg["quantity"] = int(qty)
+    return data
+
+
+class PlaceGTTOrderSchema(Schema):
+    """Schema for placing a GTT (single or two-leg OCO)."""
+
+    apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
+    strategy = fields.Str(required=True)
+    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
+    symbol = fields.Str(required=True)
+    trigger_type = fields.Str(required=True, validate=validate.OneOf(VALID_GTT_TRIGGER_TYPES))
+    trigger_prices = fields.List(
+        fields.Float(validate=validate.Range(min=0, min_inclusive=False, error="Trigger price must be positive.")),
+        required=True,
+        validate=validate.Length(min=1, max=2, error="trigger_prices must contain 1 (single) or 2 (two-leg) values."),
+    )
+    last_price = fields.Float(
+        required=True,
+        validate=validate.Range(min=0, min_inclusive=False, error="Last price must be positive."),
+    )
+    legs = fields.List(
+        fields.Nested(GTTLegSchema),
+        required=True,
+        validate=validate.Length(min=1, max=2, error="legs must contain 1 (single) or 2 (two-leg) items."),
+    )
+    expires_at = fields.Str(missing=None, allow_none=True)  # ISO-8601; optional
+
+    @post_load
+    def post_process(self, data, **kwargs):
+        return _validate_gtt_legs(data)
+
+
+class ModifyGTTOrderSchema(Schema):
+    """Schema for modifying an active GTT."""
+
+    apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
+    strategy = fields.Str(required=True)
+    trigger_id = fields.Str(required=True, validate=validate.Length(min=1))
+    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
+    symbol = fields.Str(required=True)
+    trigger_type = fields.Str(required=True, validate=validate.OneOf(VALID_GTT_TRIGGER_TYPES))
+    trigger_prices = fields.List(
+        fields.Float(validate=validate.Range(min=0, min_inclusive=False, error="Trigger price must be positive.")),
+        required=True,
+        validate=validate.Length(min=1, max=2, error="trigger_prices must contain 1 (single) or 2 (two-leg) values."),
+    )
+    last_price = fields.Float(
+        required=True,
+        validate=validate.Range(min=0, min_inclusive=False, error="Last price must be positive."),
+    )
+    legs = fields.List(
+        fields.Nested(GTTLegSchema),
+        required=True,
+        validate=validate.Length(min=1, max=2, error="legs must contain 1 (single) or 2 (two-leg) items."),
+    )
+
+    @post_load
+    def post_process(self, data, **kwargs):
+        return _validate_gtt_legs(data)
+
+
+class CancelGTTOrderSchema(Schema):
+    """Schema for cancelling an active GTT."""
+
+    apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
+    strategy = fields.Str(required=True)
+    trigger_id = fields.Str(required=True, validate=validate.Length(min=1))
+
+
+class GTTOrderBookSchema(Schema):
+    """Schema for listing all GTT triggers for a user."""
+
+    apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))

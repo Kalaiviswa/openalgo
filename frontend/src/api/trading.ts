@@ -1,5 +1,6 @@
 import type {
   ApiResponse,
+  GttOrder,
   Holding,
   MarginData,
   Order,
@@ -282,6 +283,27 @@ export const tradingApi = {
    */
   cancelAllOrders: async (): Promise<ApiResponse<void>> => {
     const response = await webClient.post<ApiResponse<void>>('/cancel_all_orders', {})
+    return response.data
+  },
+
+  /**
+   * Get the GTT (Good Till Triggered) order book — active triggers + recent history.
+   */
+  getGttOrderbook: async (apiKey: string): Promise<ApiResponse<GttOrder[]>> => {
+    const response = await apiClient.post<ApiResponse<GttOrder[]>>('/gttorderbook', {
+      apikey: apiKey,
+    })
+    return response.data
+  },
+
+  /**
+   * Cancel an active GTT trigger (uses session auth with CSRF).
+   */
+  cancelGttOrder: async (triggerId: string): Promise<ApiResponse<{ trigger_id: string }>> => {
+    const response = await webClient.post<ApiResponse<{ trigger_id: string }>>(
+      '/cancel_gtt_order',
+      { trigger_id: triggerId }
+    )
     return response.data
   },
 }

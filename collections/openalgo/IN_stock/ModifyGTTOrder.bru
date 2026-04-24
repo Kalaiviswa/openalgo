@@ -1,0 +1,33 @@
+meta {
+  name: ModifyGTTOrder
+  type: http
+  seq: 66
+}
+
+post {
+  url: http://127.0.0.1:5000/api/v1/modifygttorder
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+      "apikey": "a85992a13ab7db424c239c50826116366e9f4fd8c591345a2d23aad01ffa4d00",
+      "strategy": "My GTT Strategy",
+      "trigger_id": "123456",
+      "exchange": "NSE",
+      "symbol": "RELIANCE",
+      "trigger_type": "single",
+      "trigger_prices": [2520.0],
+      "last_price": 2560.0,
+      "legs": [
+          {
+              "action": "BUY",
+              "quantity": 1,
+              "price": 2520.0,
+              "pricetype": "LIMIT",
+              "product": "CNC"
+          }
+      ]
+  }
+}
