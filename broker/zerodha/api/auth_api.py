@@ -3,9 +3,6 @@ import json
 import os
 
 from utils.httpx_client import get_httpx_client
-from utils.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 def authenticate_broker(request_token):
@@ -39,11 +36,9 @@ def authenticate_broker(request_token):
             )
             response.raise_for_status()  # Raises an exception for 4XX/5XX responses
 
-            logger.info(f"Zerodha session/token raw response: {response.text}")
             response_data = response.json()
             if "data" in response_data and "access_token" in response_data["data"]:
                 # Access token found in response data
-                logger.info(f"Authentication successful, access token obtained response_data: {response_data['data']['access_token']}")
                 return response_data["data"]["access_token"], None
             else:
                 # Access token not present in the response
