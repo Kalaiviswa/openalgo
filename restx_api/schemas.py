@@ -1,4 +1,4 @@
-from marshmallow import Schema, ValidationError, fields, post_load, validate
+from marshmallow import EXCLUDE, Schema, ValidationError, fields, post_load, validate
 
 from utils.constants import CRYPTO_EXCHANGES, VALID_EXCHANGES
 
@@ -353,9 +353,6 @@ class MarginCalculatorSchema(Schema):
 # GTT (Good Till Triggered) Schemas
 # -----------------------------------------------------------------------------
 
-VALID_GTT_TRIGGER_TYPES = ["single", "two-leg"]
-
-
 class GTTLegSchema(Schema):
     """Schema for a single GTT leg (one order that fires when its trigger is hit)."""
 
@@ -378,25 +375,31 @@ class GTTLegSchema(Schema):
 
 
 def _validate_gtt_legs(data):
-    """Enforce the single vs two-leg rules and quantity coercion across all legs."""
-    trigger_type = data.get("trigger_type")
+    """Infer ``trigger_type`` from the number of triggers and enforce leg parity.
+
+    Rules (derived, not passed):
+        - 1 trigger + 1 leg  → ``trigger_type = "single"``
+        - 2 triggers + 2 legs → ``trigger_type = "two-leg"`` (OCO)
+        - any other combination → ValidationError
+
+    Also coerces each leg's quantity to int for non-crypto exchanges.
+    """
     trigger_prices = data.get("trigger_prices") or []
     legs = data.get("legs") or []
 
-    if trigger_type == "single":
-        if len(trigger_prices) != 1:
-            raise ValidationError(
-                {"trigger_prices": ["Single-trigger GTT requires exactly 1 trigger price."]}
-            )
-        if len(legs) != 1:
-            raise ValidationError({"legs": ["Single-trigger GTT requires exactly 1 leg."]})
-    elif trigger_type == "two-leg":
-        if len(trigger_prices) != 2:
-            raise ValidationError(
-                {"trigger_prices": ["Two-leg (OCO) GTT requires exactly 2 trigger prices."]}
-            )
-        if len(legs) != 2:
-            raise ValidationError({"legs": ["Two-leg (OCO) GTT requires exactly 2 legs."]})
+    if len(trigger_prices) == 1 and len(legs) == 1:
+        data["trigger_type"] = "single"
+    elif len(trigger_prices) == 2 and len(legs) == 2:
+        data["trigger_type"] = "two-leg"
+    else:
+        raise ValidationError(
+            {
+                "trigger_prices": [
+                    "Triggers and legs must match: 1 trigger + 1 leg (single) or "
+                    "2 triggers + 2 legs (OCO)."
+                ]
+            }
+        )
 
     # Coerce each leg's quantity to int for non-crypto exchanges (broker parity).
     exchange = data.get("exchange")
@@ -422,13 +425,20 @@ def _validate_gtt_legs(data):
 
 
 class PlaceGTTOrderSchema(Schema):
-    """Schema for placing a GTT (single or two-leg OCO)."""
+    """Schema for placing a GTT. ``trigger_type`` is inferred from the
+    number of triggers: 1 trigger + 1 leg is ``single``; 2 triggers + 2
+    legs is ``two-leg`` (OCO). Any explicit ``trigger_type`` sent by a
+    caller is dropped (via ``Meta.unknown = EXCLUDE``) so the derived
+    value is always authoritative.
+    """
+
+    class Meta:
+        unknown = EXCLUDE
 
     apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     strategy = fields.Str(required=True)
     exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
     symbol = fields.Str(required=True)
-    trigger_type = fields.Str(required=True, validate=validate.OneOf(VALID_GTT_TRIGGER_TYPES))
     trigger_prices = fields.List(
         fields.Float(validate=validate.Range(min=0, min_inclusive=False, error="Trigger price must be positive.")),
         required=True,
@@ -451,14 +461,18 @@ class PlaceGTTOrderSchema(Schema):
 
 
 class ModifyGTTOrderSchema(Schema):
-    """Schema for modifying an active GTT."""
+    """Schema for modifying an active GTT. Same ``trigger_type`` inference
+    rule as :class:`PlaceGTTOrderSchema`.
+    """
+
+    class Meta:
+        unknown = EXCLUDE
 
     apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     strategy = fields.Str(required=True)
     trigger_id = fields.Str(required=True, validate=validate.Length(min=1))
     exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
     symbol = fields.Str(required=True)
-    trigger_type = fields.Str(required=True, validate=validate.OneOf(VALID_GTT_TRIGGER_TYPES))
     trigger_prices = fields.List(
         fields.Float(validate=validate.Range(min=0, min_inclusive=False, error="Trigger price must be positive.")),
         required=True,

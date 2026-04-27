@@ -1,4 +1,4 @@
-import { Download, Loader2, RefreshCw, X } from 'lucide-react'
+import { Download, Loader2, Pencil, RefreshCw, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { tradingApi } from '@/api/trading'
 import {
@@ -16,6 +16,16 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
   Table,
   TableBody,
   TableCell,
@@ -28,6 +38,16 @@ import { useAuthStore } from '@/stores/authStore'
 import { onModeChange } from '@/stores/themeStore'
 import type { GttOrder } from '@/types/trading'
 import { showToast } from '@/utils/toast'
+
+interface ModifyLegForm {
+  trigger_price: number
+  quantity: number
+  price: number
+  // Read-only context — kept so we can echo back on submit unchanged.
+  action: string
+  pricetype: string
+  product: string
+}
 
 const gttStatusColor: Record<string, string> = {
   active: 'bg-blue-500',
@@ -65,6 +85,13 @@ export default function GttTab() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [cancellingId, setCancellingId] = useState<string | null>(null)
+
+  // Modify dialog state
+  const [modifyOpen, setModifyOpen] = useState(false)
+  const [modifyingGtt, setModifyingGtt] = useState<GttOrder | null>(null)
+  const [modifyLastPrice, setModifyLastPrice] = useState<number>(0)
+  const [modifyLegs, setModifyLegs] = useState<ModifyLegForm[]>([])
+  const [isSavingModify, setIsSavingModify] = useState(false)
 
   const fetchGtts = useCallback(
     async (showRefresh = false) => {
@@ -129,6 +156,85 @@ export default function GttTab() {
       )
     } finally {
       setCancellingId(null)
+    }
+  }
+
+  const openModify = (gtt: GttOrder) => {
+    setModifyingGtt(gtt)
+    setModifyLastPrice(Number(gtt.last_price) || 0)
+    setModifyLegs(
+      gtt.legs.map((leg, i) => ({
+        trigger_price: Number(gtt.trigger_prices[i] ?? 0),
+        quantity: Number(leg.quantity) || 0,
+        price: Number(leg.price) || 0,
+        action: String(leg.action || '').toUpperCase(),
+        pricetype: String(leg.pricetype || 'LIMIT'),
+        product: String(leg.product || 'CNC'),
+      }))
+    )
+    setModifyOpen(true)
+  }
+
+  const refreshModifyLtp = async () => {
+    if (!apiKey || !modifyingGtt) return
+    try {
+      const response = await tradingApi.getQuotes(
+        apiKey,
+        modifyingGtt.symbol,
+        modifyingGtt.exchange
+      )
+      if (response.status === 'success' && response.data) {
+        setModifyLastPrice(Number(response.data.ltp) || modifyLastPrice)
+      }
+    } catch {
+      // best-effort; keep the existing value on failure
+    }
+  }
+
+  const saveModify = async () => {
+    if (!modifyingGtt) return
+    if (modifyLastPrice <= 0) {
+      showToast.error('Last price must be > 0', 'orders')
+      return
+    }
+    if (modifyLegs.some((l) => l.trigger_price <= 0 || l.quantity <= 0 || l.price < 0)) {
+      showToast.error('Trigger price and quantity must be positive', 'orders')
+      return
+    }
+
+    setIsSavingModify(true)
+    try {
+      const response = await tradingApi.modifyGttOrder(modifyingGtt.trigger_id, {
+        symbol: modifyingGtt.symbol,
+        exchange: modifyingGtt.exchange,
+        trigger_type: (modifyingGtt.trigger_type as 'single' | 'two-leg') ?? 'single',
+        trigger_prices: modifyLegs.map((l) => l.trigger_price),
+        last_price: modifyLastPrice,
+        legs: modifyLegs.map((l) => ({
+          action: l.action,
+          quantity: l.quantity,
+          price: l.price,
+          pricetype: l.pricetype,
+          product: l.product,
+        })),
+        strategy: 'GTT Modify',
+      })
+
+      if (response.status === 'success') {
+        showToast.success(`GTT modified: ${modifyingGtt.trigger_id}`, 'orders')
+        setModifyOpen(false)
+        setTimeout(() => fetchGtts(true), 800)
+      } else {
+        showToast.error(response.message || 'Failed to modify GTT', 'orders')
+      }
+    } catch (e) {
+      const axiosError = e as { response?: { data?: { message?: string } } }
+      showToast.error(
+        axiosError.response?.data?.message || 'Failed to modify GTT',
+        'orders'
+      )
+    } finally {
+      setIsSavingModify(false)
     }
   }
 
@@ -235,6 +341,7 @@ export default function GttTab() {
                     <TableHead className="w-[100px]">Status</TableHead>
                     <TableHead className="w-[120px]">Created</TableHead>
                     <TableHead className="w-[120px]">Expires</TableHead>
+                    <TableHead className="w-[70px]">Modify</TableHead>
                     <TableHead className="w-[70px]">Cancel</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -301,6 +408,19 @@ export default function GttTab() {
                         </TableCell>
                         <TableCell>
                           {isCancellable(g.status) && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-blue-500 hover:text-blue-600"
+                              onClick={() => openModify(g)}
+                              aria-label={`Modify GTT ${g.trigger_id}`}
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {isCancellable(g.status) && (
                             <AlertDialog>
                               <AlertDialogTrigger asChild>
                                 <Button
@@ -347,6 +467,141 @@ export default function GttTab() {
           )}
         </CardContent>
       </Card>
+
+      {/* Modify GTT Dialog */}
+      <Dialog open={modifyOpen} onOpenChange={setModifyOpen}>
+        <DialogContent className="sm:max-w-[600px]">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-3">
+              <span>Modify GTT</span>
+              {modifyingGtt && (
+                <Badge variant="secondary">
+                  {modifyingGtt.trigger_type === 'two-leg' ? 'OCO' : 'Single'}
+                </Badge>
+              )}
+            </DialogTitle>
+            <DialogDescription className="sr-only">Modify GTT trigger details</DialogDescription>
+          </DialogHeader>
+
+          {modifyingGtt && (
+            <>
+              {/* Symbol + trigger ID */}
+              <div className="rounded-lg border p-4 flex items-center justify-between">
+                <div>
+                  <div className="text-lg font-semibold">{modifyingGtt.symbol}</div>
+                  <div className="text-sm text-muted-foreground">{modifyingGtt.exchange}</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-xs text-muted-foreground">Trigger ID</div>
+                  <div className="font-mono text-sm">{modifyingGtt.trigger_id}</div>
+                </div>
+              </div>
+
+              {/* Last price with a refresh button */}
+              <div className="grid grid-cols-4 items-center gap-4">
+                <Label htmlFor="modify-last-price" className="text-right">
+                  Last Price
+                </Label>
+                <div className="col-span-3 flex items-center gap-2">
+                  <Input
+                    id="modify-last-price"
+                    type="number"
+                    step="0.05"
+                    value={modifyLastPrice}
+                    onChange={(e) => setModifyLastPrice(parseFloat(e.target.value) || 0)}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={refreshModifyLtp}
+                    aria-label="Refresh LTP from quote"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+
+              {/* Per-leg editors */}
+              {modifyLegs.map((leg, idx) => (
+                <div key={`modify-leg-${idx}`} className="rounded-lg border p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Badge
+                      variant={leg.action === 'BUY' ? 'default' : 'destructive'}
+                      className={leg.action === 'BUY' ? 'bg-green-500' : ''}
+                    >
+                      {leg.action}
+                    </Badge>
+                    <span className="text-sm text-muted-foreground">
+                      Leg {idx + 1} · {leg.pricetype} · {leg.product}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    <div>
+                      <Label className="text-xs">Trigger Price</Label>
+                      <Input
+                        type="number"
+                        step="0.05"
+                        value={leg.trigger_price}
+                        onChange={(e) => {
+                          const next = [...modifyLegs]
+                          next[idx] = {
+                            ...next[idx],
+                            trigger_price: parseFloat(e.target.value) || 0,
+                          }
+                          setModifyLegs(next)
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs">Quantity</Label>
+                      <Input
+                        type="number"
+                        step="1"
+                        value={leg.quantity}
+                        onChange={(e) => {
+                          const next = [...modifyLegs]
+                          next[idx] = {
+                            ...next[idx],
+                            quantity: parseInt(e.target.value, 10) || 0,
+                          }
+                          setModifyLegs(next)
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs">Limit Price</Label>
+                      <Input
+                        type="number"
+                        step="0.05"
+                        value={leg.price}
+                        onChange={(e) => {
+                          const next = [...modifyLegs]
+                          next[idx] = {
+                            ...next[idx],
+                            price: parseFloat(e.target.value) || 0,
+                          }
+                          setModifyLegs(next)
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setModifyOpen(false)} disabled={isSavingModify}>
+              Cancel
+            </Button>
+            <Button onClick={saveModify} disabled={isSavingModify}>
+              {isSavingModify && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

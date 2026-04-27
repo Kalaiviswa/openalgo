@@ -789,6 +789,59 @@ def cancel_order_ui():
         return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
 
 
+@orders_bp.route("/modify_gtt_order", methods=["POST"])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def modify_gtt_order_ui():
+    """Modify an active GTT trigger from the UI (session-auth).
+
+    Replaces trigger_prices, last_price, and all legs — the broker's PUT
+    semantics require the full shape, so the frontend sends the complete
+    replacement body alongside trigger_id.
+    """
+    try:
+        login_username = session["user"]
+        auth_token = get_auth_token(login_username)
+        broker_name = session.get("broker")
+
+        if not auth_token or not broker_name:
+            return jsonify({"status": "error", "message": "Authentication error"}), 401
+
+        data = request.get_json() or {}
+        trigger_id = data.get("trigger_id")
+        if not trigger_id:
+            return jsonify({"status": "error", "message": "trigger_id is required"}), 400
+
+        from services.modify_gtt_order_service import modify_gtt_order
+
+        api_key = None
+        if get_analyze_mode():
+            api_key = get_api_key_for_tradingview(login_username)
+
+        order_data = {
+            "trigger_id": str(trigger_id),
+            "strategy": data.get("strategy", "GTT Modify"),
+            "symbol": data.get("symbol"),
+            "exchange": data.get("exchange"),
+            "trigger_type": data.get("trigger_type"),
+            "trigger_prices": data.get("trigger_prices", []),
+            "last_price": data.get("last_price"),
+            "legs": data.get("legs", []),
+        }
+
+        success, response_data, status_code = modify_gtt_order(
+            order_data=order_data,
+            api_key=api_key,
+            auth_token=auth_token,
+            broker=broker_name,
+        )
+        return jsonify(response_data), status_code
+
+    except Exception as e:
+        logger.exception(f"Error in modify_gtt_order_ui endpoint: {str(e)}")
+        return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
+
+
 @orders_bp.route("/cancel_gtt_order", methods=["POST"])
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)

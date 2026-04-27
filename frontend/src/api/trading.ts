@@ -306,4 +306,34 @@ export const tradingApi = {
     )
     return response.data
   },
+
+  /**
+   * Modify an active GTT trigger (uses session auth with CSRF).
+   * PUT semantics: frontend sends the full replacement body (trigger_prices,
+   * last_price, legs) alongside trigger_id.
+   */
+  modifyGttOrder: async (
+    triggerId: string,
+    payload: {
+      symbol: string
+      exchange: string
+      trigger_type: 'single' | 'two-leg'
+      trigger_prices: number[]
+      last_price: number
+      legs: Array<{
+        action: 'BUY' | 'SELL' | string
+        quantity: number
+        price: number
+        pricetype: string
+        product: string
+      }>
+      strategy?: string
+    }
+  ): Promise<ApiResponse<{ trigger_id: string }>> => {
+    const response = await webClient.post<ApiResponse<{ trigger_id: string }>>(
+      '/modify_gtt_order',
+      { trigger_id: triggerId, ...payload }
+    )
+    return response.data
+  },
 }
