@@ -39,14 +39,19 @@ import { onModeChange } from '@/stores/themeStore'
 import type { GttOrder } from '@/types/trading'
 import { showToast } from '@/utils/toast'
 
-interface ModifyLegForm {
-  trigger_price: number
-  quantity: number
-  price: number
-  // Read-only context — kept so we can echo back on submit unchanged.
+interface ModifyForm {
+  trigger_type: 'SINGLE' | 'OCO'
   action: string
-  pricetype: string
   product: string
+  pricetype: string
+  quantity: number
+  // SINGLE: the trigger and limit price.
+  // OCO: target trigger and stoploss-leg's limit price (paired with stoploss/target below).
+  trigger_price: number
+  price: number
+  // OCO-only.
+  stoploss: number
+  target: number
 }
 
 const gttStatusColor: Record<string, string> = {
@@ -71,6 +76,7 @@ function formatDateTime(iso?: string): string {
   return d.toLocaleString('en-IN', {
     day: '2-digit',
     month: 'short',
+    year: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
   })
@@ -89,8 +95,7 @@ export default function GttTab() {
   // Modify dialog state
   const [modifyOpen, setModifyOpen] = useState(false)
   const [modifyingGtt, setModifyingGtt] = useState<GttOrder | null>(null)
-  const [modifyLastPrice, setModifyLastPrice] = useState<number>(0)
-  const [modifyLegs, setModifyLegs] = useState<ModifyLegForm[]>([])
+  const [modifyForm, setModifyForm] = useState<ModifyForm | null>(null)
   const [isSavingModify, setIsSavingModify] = useState(false)
 
   const fetchGtts = useCallback(
@@ -161,45 +166,43 @@ export default function GttTab() {
 
   const openModify = (gtt: GttOrder) => {
     setModifyingGtt(gtt)
-    setModifyLastPrice(Number(gtt.last_price) || 0)
-    setModifyLegs(
-      gtt.legs.map((leg, i) => ({
-        trigger_price: Number(gtt.trigger_prices[i] ?? 0),
-        quantity: Number(leg.quantity) || 0,
-        price: Number(leg.price) || 0,
-        action: String(leg.action || '').toUpperCase(),
-        pricetype: String(leg.pricetype || 'LIMIT'),
-        product: String(leg.product || 'CNC'),
-      }))
-    )
+
+    const isOco = gtt.trigger_type === 'two-leg'
+    const firstLeg = gtt.legs[0] ?? { action: 'BUY', quantity: 0, price: 0, pricetype: 'LIMIT', product: 'CNC' }
+    // OCO leg ordering matches Kite's ascending trigger_values: [stoploss_leg, target_leg].
+    const targetLeg = gtt.legs[1] ?? firstLeg
+
+    setModifyForm({
+      trigger_type: isOco ? 'OCO' : 'SINGLE',
+      action: String(firstLeg.action || '').toUpperCase(),
+      product: String(firstLeg.product || 'CNC'),
+      pricetype: String(firstLeg.pricetype || 'LIMIT'),
+      quantity: Number(firstLeg.quantity) || 0,
+      // SINGLE: the only leg's trigger + limit. OCO: target trigger + stoploss-leg limit.
+      trigger_price: Number(gtt.trigger_prices[isOco ? 1 : 0] ?? 0),
+      price: Number(firstLeg.price) || 0,
+      // OCO-only.
+      stoploss: isOco ? Number(gtt.trigger_prices[0] ?? 0) : 0,
+      target: isOco ? Number(targetLeg.price) || 0 : 0,
+    })
     setModifyOpen(true)
   }
 
-  const refreshModifyLtp = async () => {
-    if (!apiKey || !modifyingGtt) return
-    try {
-      const response = await tradingApi.getQuotes(
-        apiKey,
-        modifyingGtt.symbol,
-        modifyingGtt.exchange
-      )
-      if (response.status === 'success' && response.data) {
-        setModifyLastPrice(Number(response.data.ltp) || modifyLastPrice)
-      }
-    } catch {
-      // best-effort; keep the existing value on failure
-    }
-  }
-
   const saveModify = async () => {
-    if (!modifyingGtt) return
-    if (modifyLastPrice <= 0) {
-      showToast.error('Last price must be > 0', 'orders')
+    if (!modifyingGtt || !modifyForm) return
+    if (modifyForm.trigger_price <= 0 || modifyForm.quantity <= 0 || modifyForm.price < 0) {
+      showToast.error('Trigger price, quantity, and limit price must be positive', 'orders')
       return
     }
-    if (modifyLegs.some((l) => l.trigger_price <= 0 || l.quantity <= 0 || l.price < 0)) {
-      showToast.error('Trigger price and quantity must be positive', 'orders')
-      return
+    if (modifyForm.trigger_type === 'OCO') {
+      if (modifyForm.stoploss <= 0 || modifyForm.target <= 0) {
+        showToast.error('Stoploss trigger and target limit are required for OCO', 'orders')
+        return
+      }
+      if (modifyForm.stoploss >= modifyForm.trigger_price) {
+        showToast.error('Stoploss trigger must be less than target trigger', 'orders')
+        return
+      }
     }
 
     setIsSavingModify(true)
@@ -207,16 +210,15 @@ export default function GttTab() {
       const response = await tradingApi.modifyGttOrder(modifyingGtt.trigger_id, {
         symbol: modifyingGtt.symbol,
         exchange: modifyingGtt.exchange,
-        trigger_type: (modifyingGtt.trigger_type as 'single' | 'two-leg') ?? 'single',
-        trigger_prices: modifyLegs.map((l) => l.trigger_price),
-        last_price: modifyLastPrice,
-        legs: modifyLegs.map((l) => ({
-          action: l.action,
-          quantity: l.quantity,
-          price: l.price,
-          pricetype: l.pricetype,
-          product: l.product,
-        })),
+        trigger_type: modifyForm.trigger_type,
+        action: modifyForm.action,
+        product: modifyForm.product,
+        pricetype: modifyForm.pricetype,
+        quantity: modifyForm.quantity,
+        price: modifyForm.price,
+        trigger_price: modifyForm.trigger_price,
+        stoploss: modifyForm.trigger_type === 'OCO' ? modifyForm.stoploss : null,
+        target: modifyForm.trigger_type === 'OCO' ? modifyForm.target : null,
         strategy: 'GTT Modify',
       })
 
@@ -497,97 +499,131 @@ export default function GttTab() {
                 </div>
               </div>
 
-              {/* Last price with a refresh button */}
-              <div className="grid grid-cols-4 items-center gap-4">
-                <Label htmlFor="modify-last-price" className="text-right">
-                  Last Price
-                </Label>
-                <div className="col-span-3 flex items-center gap-2">
-                  <Input
-                    id="modify-last-price"
-                    type="number"
-                    step="0.05"
-                    value={modifyLastPrice}
-                    onChange={(e) => setModifyLastPrice(parseFloat(e.target.value) || 0)}
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={refreshModifyLtp}
-                    aria-label="Refresh LTP from quote"
-                  >
-                    <RefreshCw className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
-
-              {/* Per-leg editors */}
-              {modifyLegs.map((leg, idx) => (
-                <div key={`modify-leg-${idx}`} className="rounded-lg border p-4 space-y-3">
+              {/* Flat order params */}
+              {modifyForm && (
+                <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center gap-2">
                     <Badge
-                      variant={leg.action === 'BUY' ? 'default' : 'destructive'}
-                      className={leg.action === 'BUY' ? 'bg-green-500' : ''}
+                      variant={modifyForm.action === 'BUY' ? 'default' : 'destructive'}
+                      className={modifyForm.action === 'BUY' ? 'bg-green-500' : ''}
                     >
-                      {leg.action}
+                      {modifyForm.action}
                     </Badge>
                     <span className="text-sm text-muted-foreground">
-                      Leg {idx + 1} · {leg.pricetype} · {leg.product}
+                      {modifyForm.pricetype} · {modifyForm.product}
                     </span>
                   </div>
-                  <div className="grid grid-cols-3 gap-3">
-                    <div>
-                      <Label className="text-xs">Trigger Price</Label>
-                      <Input
-                        type="number"
-                        step="0.05"
-                        value={leg.trigger_price}
-                        onChange={(e) => {
-                          const next = [...modifyLegs]
-                          next[idx] = {
-                            ...next[idx],
-                            trigger_price: parseFloat(e.target.value) || 0,
-                          }
-                          setModifyLegs(next)
-                        }}
-                      />
-                    </div>
+
+                  <div className="grid grid-cols-2 gap-3">
                     <div>
                       <Label className="text-xs">Quantity</Label>
                       <Input
                         type="number"
                         step="1"
-                        value={leg.quantity}
-                        onChange={(e) => {
-                          const next = [...modifyLegs]
-                          next[idx] = {
-                            ...next[idx],
+                        value={modifyForm.quantity}
+                        onChange={(e) =>
+                          setModifyForm({
+                            ...modifyForm,
                             quantity: parseInt(e.target.value, 10) || 0,
-                          }
-                          setModifyLegs(next)
-                        }}
-                      />
-                    </div>
-                    <div>
-                      <Label className="text-xs">Limit Price</Label>
-                      <Input
-                        type="number"
-                        step="0.05"
-                        value={leg.price}
-                        onChange={(e) => {
-                          const next = [...modifyLegs]
-                          next[idx] = {
-                            ...next[idx],
-                            price: parseFloat(e.target.value) || 0,
-                          }
-                          setModifyLegs(next)
-                        }}
+                          })
+                        }
                       />
                     </div>
                   </div>
+
+                  {modifyForm.trigger_type === 'SINGLE' ? (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <Label className="text-xs">Trigger Price</Label>
+                        <Input
+                          type="number"
+                          step="0.05"
+                          value={modifyForm.trigger_price}
+                          onChange={(e) =>
+                            setModifyForm({
+                              ...modifyForm,
+                              trigger_price: parseFloat(e.target.value) || 0,
+                            })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-xs">Limit Price</Label>
+                        <Input
+                          type="number"
+                          step="0.05"
+                          value={modifyForm.price}
+                          onChange={(e) =>
+                            setModifyForm({
+                              ...modifyForm,
+                              price: parseFloat(e.target.value) || 0,
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <Label className="text-xs">Stoploss Trigger</Label>
+                        <Input
+                          type="number"
+                          step="0.05"
+                          value={modifyForm.stoploss}
+                          onChange={(e) =>
+                            setModifyForm({
+                              ...modifyForm,
+                              stoploss: parseFloat(e.target.value) || 0,
+                            })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-xs">Stoploss Limit</Label>
+                        <Input
+                          type="number"
+                          step="0.05"
+                          value={modifyForm.price}
+                          onChange={(e) =>
+                            setModifyForm({
+                              ...modifyForm,
+                              price: parseFloat(e.target.value) || 0,
+                            })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-xs">Target Trigger</Label>
+                        <Input
+                          type="number"
+                          step="0.05"
+                          value={modifyForm.trigger_price}
+                          onChange={(e) =>
+                            setModifyForm({
+                              ...modifyForm,
+                              trigger_price: parseFloat(e.target.value) || 0,
+                            })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-xs">Target Limit</Label>
+                        <Input
+                          type="number"
+                          step="0.05"
+                          value={modifyForm.target}
+                          onChange={(e) =>
+                            setModifyForm({
+                              ...modifyForm,
+                              target: parseFloat(e.target.value) || 0,
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
-              ))}
+              )}
             </>
           )}
 

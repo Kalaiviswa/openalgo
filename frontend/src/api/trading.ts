@@ -309,24 +309,23 @@ export const tradingApi = {
 
   /**
    * Modify an active GTT trigger (uses session auth with CSRF).
-   * PUT semantics: frontend sends the full replacement body (trigger_prices,
-   * last_price, legs) alongside trigger_id.
+   * Flat replacement body — same shape as PlaceGTTOrder plus trigger_id.
+   * last_price is fetched server-side from the broker's quotes endpoint.
    */
   modifyGttOrder: async (
     triggerId: string,
     payload: {
       symbol: string
       exchange: string
-      trigger_type: 'single' | 'two-leg'
-      trigger_prices: number[]
-      last_price: number
-      legs: Array<{
-        action: 'BUY' | 'SELL' | string
-        quantity: number
-        price: number
-        pricetype: string
-        product: string
-      }>
+      trigger_type: 'SINGLE' | 'OCO'
+      action: 'BUY' | 'SELL' | string
+      product: string
+      quantity: number
+      pricetype: string
+      price: number
+      trigger_price: number
+      stoploss?: number | null
+      target?: number | null
       strategy?: string
     }
   ): Promise<ApiResponse<{ trigger_id: string }>> => {

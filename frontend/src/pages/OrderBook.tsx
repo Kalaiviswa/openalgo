@@ -410,9 +410,13 @@ export default function OrderBook() {
       </div>
 
       <Tabs defaultValue="orders" className="space-y-6">
-        <TabsList>
-          <TabsTrigger value="orders">Orders</TabsTrigger>
-          <TabsTrigger value="gtt">GTT</TabsTrigger>
+        <TabsList className="h-10">
+          <TabsTrigger value="orders" className="min-w-[110px] text-sm">
+            Orders
+          </TabsTrigger>
+          <TabsTrigger value="gtt" className="min-w-[110px] text-sm">
+            GTT
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="orders" className="space-y-6">

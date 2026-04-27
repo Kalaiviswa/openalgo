@@ -4,52 +4,68 @@
 from database.token_db import get_br_symbol, get_oa_symbol
 
 
-def _leg_to_order(leg, tradingsymbol, exchange):
-    """Map one OpenAlgo leg to a Kite `orders[]` entry."""
+def _build_order(data, price, tradingsymbol, exchange):
+    """Build one Kite `orders[]` entry sharing action/qty/product/pricetype across legs."""
     return {
         "exchange": exchange,
         "tradingsymbol": tradingsymbol,
-        "transaction_type": leg["action"].upper(),
-        "quantity": int(leg["quantity"]),
-        "order_type": leg.get("pricetype", "LIMIT"),
-        "product": leg["product"],
-        "price": float(leg["price"]),
+        "transaction_type": data["action"].upper(),
+        "quantity": int(data["quantity"]),
+        "order_type": data.get("pricetype", "LIMIT"),
+        "product": data["product"],
+        "price": float(price),
     }
 
 
 def transform_place_gtt(data):
-    """Transform an OpenAlgo place-GTT payload into Kite's `{type, condition, orders}`.
+    """Transform an OpenAlgo flat place-GTT payload into Kite's `{type, condition, orders}`.
 
-    Expected ``data`` keys:
-        symbol, exchange, trigger_type ("single" | "two-leg"),
-        trigger_prices (list[float], len 1 or 2), last_price (float),
-        legs (list of {action, quantity, price, pricetype, product}, matching legs).
+    Expected ``data`` keys (post-schema):
+        symbol, exchange, trigger_type ("SINGLE" | "OCO"), action, product,
+        quantity, pricetype, price, trigger_price, last_price, and for OCO
+        also stoploss + target.
 
-    Returns a dict with the three Kite top-level keys. Caller is responsible
-    for JSON-encoding ``condition`` and ``orders`` and URL-encoding the form.
+    Mapping:
+        SINGLE → trigger=trigger_price, limit=price.
+        OCO    → stoploss leg (trigger=stoploss, limit=price) +
+                 target leg   (trigger=trigger_price, limit=target).
+                 trigger_values is sorted low→high as Kite requires.
+
+    Caller is responsible for JSON-encoding ``condition`` and ``orders`` and
+    URL-encoding the form.
     """
     tradingsymbol = get_br_symbol(data["symbol"], data["exchange"])
     exchange = data["exchange"]
+    trigger_type_oa = (data.get("trigger_type") or "").upper()
+
+    if trigger_type_oa == "OCO":
+        kite_type = "two-leg"
+        trigger_values = [float(data["stoploss"]), float(data["trigger_price"])]
+        orders = [
+            _build_order(data, data["price"], tradingsymbol, exchange),
+            _build_order(data, data["target"], tradingsymbol, exchange),
+        ]
+    else:  # SINGLE
+        kite_type = "single"
+        trigger_values = [float(data["trigger_price"])]
+        orders = [_build_order(data, data["price"], tradingsymbol, exchange)]
 
     condition = {
         "exchange": exchange,
         "tradingsymbol": tradingsymbol,
-        "trigger_values": [float(p) for p in data["trigger_prices"]],
+        "trigger_values": trigger_values,
         "last_price": float(data["last_price"]),
     }
 
-    orders = [_leg_to_order(leg, tradingsymbol, exchange) for leg in data["legs"]]
-
-    return {
-        "type": data["trigger_type"],  # "single" | "two-leg"
-        "condition": condition,
-        "orders": orders,
-    }
+    return {"type": kite_type, "condition": condition, "orders": orders}
 
 
 def transform_modify_gtt(data):
-    """Transform an OpenAlgo modify-GTT payload into Kite's `{type, condition, orders}`."""
-    # Kite's PUT /gtt/triggers/:id takes the same shape as POST.
+    """Transform an OpenAlgo modify-GTT payload (flat shape) into Kite's body.
+
+    Kite's PUT /gtt/triggers/:id takes the same ``{type, condition, orders}``
+    shape as POST, so the place transform is reused.
+    """
     return transform_place_gtt(data)
 
 

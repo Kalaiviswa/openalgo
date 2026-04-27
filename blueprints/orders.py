@@ -795,9 +795,8 @@ def cancel_order_ui():
 def modify_gtt_order_ui():
     """Modify an active GTT trigger from the UI (session-auth).
 
-    Replaces trigger_prices, last_price, and all legs — the broker's PUT
-    semantics require the full shape, so the frontend sends the complete
-    replacement body alongside trigger_id.
+    Accepts the flat replacement body — same shape as PlaceGTTOrder plus
+    ``trigger_id``. ``last_price`` is fetched server-side by the broker.
     """
     try:
         login_username = session["user"]
@@ -824,9 +823,14 @@ def modify_gtt_order_ui():
             "symbol": data.get("symbol"),
             "exchange": data.get("exchange"),
             "trigger_type": data.get("trigger_type"),
-            "trigger_prices": data.get("trigger_prices", []),
-            "last_price": data.get("last_price"),
-            "legs": data.get("legs", []),
+            "action": data.get("action"),
+            "product": data.get("product"),
+            "quantity": data.get("quantity"),
+            "pricetype": data.get("pricetype", "LIMIT"),
+            "price": data.get("price"),
+            "trigger_price": data.get("trigger_price"),
+            "stoploss": data.get("stoploss"),
+            "target": data.get("target"),
         }
 
         success, response_data, status_code = modify_gtt_order(

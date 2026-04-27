@@ -90,13 +90,21 @@ def place_gtt_order_with_auth(
 
     if res.status == 200 and trigger_id:
         success_response = {"status": "success", "trigger_id": trigger_id, "mode": "live"}
+        # Derive trigger_prices for the event from the flat fields.
+        if (order_data.get("trigger_type") or "").upper() == "OCO":
+            event_trigger_prices = [
+                float(order_data.get("stoploss") or 0),
+                float(order_data.get("trigger_price") or 0),
+            ]
+        else:
+            event_trigger_prices = [float(order_data.get("trigger_price") or 0)]
         bus.publish(GTTPlacedEvent(
             mode="live", api_type=API_TYPE,
             strategy=order_data.get("strategy", ""),
             symbol=order_data.get("symbol", ""), exchange=order_data.get("exchange", ""),
             trigger_type=order_data.get("trigger_type", ""),
             trigger_id=trigger_id,
-            trigger_prices=list(order_data.get("trigger_prices", [])),
+            trigger_prices=event_trigger_prices,
             request_data=order_request_data, response_data=success_response, api_key=api_key,
         ))
         return True, success_response, 200

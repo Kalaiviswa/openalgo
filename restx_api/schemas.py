@@ -1,4 +1,4 @@
-from marshmallow import EXCLUDE, Schema, ValidationError, fields, post_load, validate
+from marshmallow import EXCLUDE, Schema, ValidationError, fields, post_load, pre_load, validate
 
 from utils.constants import CRYPTO_EXCHANGES, VALID_EXCHANGES
 
@@ -353,83 +353,86 @@ class MarginCalculatorSchema(Schema):
 # GTT (Good Till Triggered) Schemas
 # -----------------------------------------------------------------------------
 
-class GTTLegSchema(Schema):
-    """Schema for a single GTT leg (one order that fires when its trigger is hit)."""
+def _validate_gtt_place_request(data):
+    """Validate flat GTT-place fields and normalise.
 
-    action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
-    quantity = fields.Float(
-        required=True,
-        validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number."),
-    )
-    price = fields.Float(
-        required=True, validate=validate.Range(min=0, error="Price must be a non-negative number.")
-    )
-    # Most brokers (Zerodha incl.) only support LIMIT for GTT legs.
-    pricetype = fields.Str(missing="LIMIT", validate=validate.OneOf(["LIMIT", "MARKET"]))
-    product = fields.Str(required=True, validate=validate.OneOf(["MIS", "NRML", "CNC"]))
+    SINGLE: a single trigger value is required. Callers may pass it as any of
+    ``trigger_price``, ``stoploss``, or ``target`` — whichever is non-zero is
+    used as the trigger. Direction (above/below LTP) is inferred by the broker
+    from the trigger value vs current price. ``price`` is the order's limit.
+    OCO: ``stoploss`` (stoploss trigger) + ``price`` (stoploss leg limit) and
+         ``trigger_price`` (target trigger) + ``target`` (target leg limit).
 
-    @post_load
-    def normalise(self, data, **kwargs):
-        data["action"] = data["action"].upper()
-        return data
-
-
-def _validate_gtt_legs(data):
-    """Infer ``trigger_type`` from the number of triggers and enforce leg parity.
-
-    Rules (derived, not passed):
-        - 1 trigger + 1 leg  → ``trigger_type = "single"``
-        - 2 triggers + 2 legs → ``trigger_type = "two-leg"`` (OCO)
-        - any other combination → ValidationError
-
-    Also coerces each leg's quantity to int for non-crypto exchanges.
+    On SINGLE the unused trigger fields are cleared so downstream consumers
+    can rely on ``trigger_price`` being the resolved trigger and stoploss/
+    target being absent.
     """
-    trigger_prices = data.get("trigger_prices") or []
-    legs = data.get("legs") or []
+    trigger_type = (data.get("trigger_type") or "").upper()
+    if trigger_type not in ("SINGLE", "OCO"):
+        raise ValidationError({"trigger_type": ["Must be 'SINGLE' or 'OCO'."]})
+    data["trigger_type"] = trigger_type
 
-    if len(trigger_prices) == 1 and len(legs) == 1:
-        data["trigger_type"] = "single"
-    elif len(trigger_prices) == 2 and len(legs) == 2:
-        data["trigger_type"] = "two-leg"
-    else:
-        raise ValidationError(
-            {
-                "trigger_prices": [
-                    "Triggers and legs must match: 1 trigger + 1 leg (single) or "
-                    "2 triggers + 2 legs (OCO)."
+    if trigger_type == "OCO":
+        stoploss = data.get("stoploss")
+        target = data.get("target")
+        trigger_price = data.get("trigger_price")
+        if stoploss in (None, 0, 0.0):
+            raise ValidationError({"stoploss": ["Required for OCO (stoploss trigger price)."]})
+        if target in (None, 0, 0.0):
+            raise ValidationError({"target": ["Required for OCO (target leg limit price)."]})
+        if trigger_price in (None, 0, 0.0):
+            raise ValidationError({"trigger_price": ["Required for OCO (target trigger price)."]})
+        if float(stoploss) >= float(trigger_price):
+            raise ValidationError({
+                "stoploss": [
+                    "Stoploss trigger must be less than the target trigger (trigger_price)."
                 ]
-            }
+            })
+    else:  # SINGLE — pick the first non-zero trigger from trigger_price / stoploss / target.
+        candidates = [
+            data.get("trigger_price"),
+            data.get("stoploss"),
+            data.get("target"),
+        ]
+        resolved = next(
+            (float(c) for c in candidates if c not in (None, 0, 0.0)),
+            None,
         )
+        if resolved is None or resolved <= 0:
+            raise ValidationError({
+                "trigger_price": [
+                    "SINGLE GTT requires a positive trigger value via trigger_price, stoploss, or target."
+                ]
+            })
+        data["trigger_price"] = resolved
+        data["stoploss"] = None
+        data["target"] = None
 
-    # Coerce each leg's quantity to int for non-crypto exchanges (broker parity).
     exchange = data.get("exchange")
-    if exchange and exchange not in CRYPTO_EXCHANGES:
-        for i, leg in enumerate(legs):
-            qty = leg.get("quantity")
-            if qty is None:
-                continue
-            if qty != int(qty):
-                raise ValidationError(
-                    {
-                        "legs": {
-                            i: {
-                                "quantity": [
-                                    f"Fractional quantity ({qty}) is not allowed for non-crypto exchanges."
-                                ]
-                            }
-                        }
-                    }
-                )
-            leg["quantity"] = int(qty)
+    qty = data.get("quantity")
+    if qty is not None and exchange and exchange not in CRYPTO_EXCHANGES:
+        if qty != int(qty):
+            raise ValidationError({
+                "quantity": [f"Fractional quantity ({qty}) is not allowed for non-crypto exchanges."]
+            })
+        data["quantity"] = int(qty)
+
+    data["action"] = data["action"].upper()
     return data
 
 
 class PlaceGTTOrderSchema(Schema):
-    """Schema for placing a GTT. ``trigger_type`` is inferred from the
-    number of triggers: 1 trigger + 1 leg is ``single``; 2 triggers + 2
-    legs is ``two-leg`` (OCO). Any explicit ``trigger_type`` sent by a
-    caller is dropped (via ``Meta.unknown = EXCLUDE``) so the derived
-    value is always authoritative.
+    """Schema for placing a GTT in the flat shape.
+
+    Required fields (all GTTs): apikey, strategy, trigger_type ('SINGLE' or
+    'OCO'), exchange, symbol, action, product, quantity, pricetype, price,
+    trigger_price.
+
+    OCO-only: ``stoploss`` (stoploss trigger) and ``target`` (target leg's
+    limit price). For SINGLE these may be omitted or sent as empty strings.
+
+    ``last_price`` is fetched server-side from the quotes API and should not
+    be sent by clients.
     """
 
     class Meta:
@@ -437,32 +440,47 @@ class PlaceGTTOrderSchema(Schema):
 
     apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     strategy = fields.Str(required=True)
+    trigger_type = fields.Str(required=True)
     exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
     symbol = fields.Str(required=True)
-    trigger_prices = fields.List(
-        fields.Float(validate=validate.Range(min=0, min_inclusive=False, error="Trigger price must be positive.")),
+    action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
+    product = fields.Str(required=True, validate=validate.OneOf(["MIS", "NRML", "CNC"]))
+    quantity = fields.Float(
         required=True,
-        validate=validate.Length(min=1, max=2, error="trigger_prices must contain 1 (single) or 2 (two-leg) values."),
+        validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number."),
     )
-    last_price = fields.Float(
+    pricetype = fields.Str(missing="LIMIT", validate=validate.OneOf(["LIMIT", "MARKET"]))
+    price = fields.Float(
         required=True,
-        validate=validate.Range(min=0, min_inclusive=False, error="Last price must be positive."),
+        validate=validate.Range(min=0, error="Price must be a non-negative number."),
     )
-    legs = fields.List(
-        fields.Nested(GTTLegSchema),
-        required=True,
-        validate=validate.Length(min=1, max=2, error="legs must contain 1 (single) or 2 (two-leg) items."),
+    trigger_price = fields.Float(
+        missing=0.0,
+        validate=validate.Range(min=0, error="Trigger price must be non-negative."),
     )
-    expires_at = fields.Str(missing=None, allow_none=True)  # ISO-8601; optional
+    stoploss = fields.Float(missing=None, allow_none=True)
+    target = fields.Float(missing=None, allow_none=True)
+    expires_at = fields.Str(missing=None, allow_none=True)
+
+    @pre_load
+    def coerce_empty_to_none(self, data, **kwargs):
+        if isinstance(data, dict):
+            for key in ("stoploss", "target"):
+                if data.get(key) == "":
+                    data[key] = None
+        return data
 
     @post_load
     def post_process(self, data, **kwargs):
-        return _validate_gtt_legs(data)
+        return _validate_gtt_place_request(data)
 
 
 class ModifyGTTOrderSchema(Schema):
-    """Schema for modifying an active GTT. Same ``trigger_type`` inference
-    rule as :class:`PlaceGTTOrderSchema`.
+    """Schema for modifying an active GTT in the flat shape.
+
+    Same fields as :class:`PlaceGTTOrderSchema`, plus ``trigger_id``. Modify
+    is a full replacement: the broker's PUT semantics replace trigger prices,
+    last price, and order params atomically.
     """
 
     class Meta:
@@ -471,26 +489,38 @@ class ModifyGTTOrderSchema(Schema):
     apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     strategy = fields.Str(required=True)
     trigger_id = fields.Str(required=True, validate=validate.Length(min=1))
+    trigger_type = fields.Str(required=True)
     exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
     symbol = fields.Str(required=True)
-    trigger_prices = fields.List(
-        fields.Float(validate=validate.Range(min=0, min_inclusive=False, error="Trigger price must be positive.")),
+    action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
+    product = fields.Str(required=True, validate=validate.OneOf(["MIS", "NRML", "CNC"]))
+    quantity = fields.Float(
         required=True,
-        validate=validate.Length(min=1, max=2, error="trigger_prices must contain 1 (single) or 2 (two-leg) values."),
+        validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number."),
     )
-    last_price = fields.Float(
+    pricetype = fields.Str(missing="LIMIT", validate=validate.OneOf(["LIMIT", "MARKET"]))
+    price = fields.Float(
         required=True,
-        validate=validate.Range(min=0, min_inclusive=False, error="Last price must be positive."),
+        validate=validate.Range(min=0, error="Price must be a non-negative number."),
     )
-    legs = fields.List(
-        fields.Nested(GTTLegSchema),
-        required=True,
-        validate=validate.Length(min=1, max=2, error="legs must contain 1 (single) or 2 (two-leg) items."),
+    trigger_price = fields.Float(
+        missing=0.0,
+        validate=validate.Range(min=0, error="Trigger price must be non-negative."),
     )
+    stoploss = fields.Float(missing=None, allow_none=True)
+    target = fields.Float(missing=None, allow_none=True)
+
+    @pre_load
+    def coerce_empty_to_none(self, data, **kwargs):
+        if isinstance(data, dict):
+            for key in ("stoploss", "target"):
+                if data.get(key) == "":
+                    data[key] = None
+        return data
 
     @post_load
     def post_process(self, data, **kwargs):
-        return _validate_gtt_legs(data)
+        return _validate_gtt_place_request(data)
 
 
 class CancelGTTOrderSchema(Schema):

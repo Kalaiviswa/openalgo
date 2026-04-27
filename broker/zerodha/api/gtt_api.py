@@ -35,8 +35,41 @@ def _encode_gtt_payload(transformed):
     )
 
 
+def _fetch_last_price(symbol, exchange, auth):
+    """Fetch LTP from Kite via the broker's own data handler.
+
+    Kite's GTT condition requires ``last_price`` — clients no longer send it,
+    so the broker layer resolves it just-in-time before placing.
+    """
+    from broker.zerodha.api.data import BrokerData
+
+    quotes = BrokerData(auth).get_quotes(symbol, exchange)
+    if not quotes:
+        return None
+    ltp = quotes.get("ltp") if isinstance(quotes, dict) else None
+    return float(ltp) if ltp else None
+
+
 def place_gtt_order(data, auth):
-    """Create a GTT on Zerodha. Returns (response, response_dict, trigger_id)."""
+    """Create a GTT on Zerodha. Returns (response, response_dict, trigger_id).
+
+    If ``data['last_price']`` is missing, it is fetched server-side from
+    Zerodha's quotes endpoint.
+    """
+    if not data.get("last_price"):
+        ltp = _fetch_last_price(data["symbol"], data["exchange"], auth)
+        if not ltp:
+            class _FakeResponse:
+                status_code = 502
+                status = 502
+                text = ""
+            return (
+                _FakeResponse(),
+                {"status": "error", "message": "Failed to fetch last_price from Zerodha quotes"},
+                None,
+            )
+        data["last_price"] = ltp
+
     transformed = transform_place_gtt(data)
     body = _encode_gtt_payload(transformed)
     logger.info(f"Zerodha place_gtt payload: type={transformed['type']}, body={body}")
@@ -58,12 +91,20 @@ def place_gtt_order(data, auth):
 def modify_gtt_order(data, auth):
     """Modify an active GTT on Zerodha. Returns (response_dict, status_code).
 
-    ``data`` must include ``trigger_id`` plus the full replacement body
-    (type / condition / orders) — Kite's PUT replaces all three.
+    ``data`` must include ``trigger_id`` plus the flat replacement body
+    (trigger_type, action, product, quantity, pricetype, price, trigger_price,
+    and OCO-only stoploss + target). ``last_price`` is fetched if missing.
+    Kite's PUT replaces type/condition/orders atomically.
     """
     trigger_id = data.get("trigger_id")
     if not trigger_id:
         return {"status": "error", "message": "trigger_id is required"}, 400
+
+    if not data.get("last_price"):
+        ltp = _fetch_last_price(data["symbol"], data["exchange"], auth)
+        if not ltp:
+            return {"status": "error", "message": "Failed to fetch last_price from Zerodha quotes"}, 502
+        data["last_price"] = ltp
 
     transformed = transform_modify_gtt(data)
     body = _encode_gtt_payload(transformed)
