@@ -258,8 +258,23 @@ $SUDO sed -i "s|YOUR_BROKER_API_KEY|$BROKER_API_KEY|g" .env
 $SUDO sed -i "s|YOUR_BROKER_API_SECRET|$BROKER_API_SECRET|g" .env
 $SUDO sed -i "s|http://127.0.0.1:5000|https://$DOMAIN|g" .env
 $SUDO sed -i "s|<broker>|$BROKER_NAME|g" .env
-$SUDO sed -i "s|3daa0403ce2501ee7432b75bf100048e3cf510d63d2754f952e93d88bf07ea84|$APP_KEY|g" .env
-$SUDO sed -i "s|a25d94718479b170c16278e321ea6c989358bf499a658fd20c90033cef8ce772|$API_KEY_PEPPER|g" .env
+$SUDO sed -i "s|OPENALGO_PLACEHOLDER_APP_KEY_REGENERATE_BEFORE_USE|$APP_KEY|g" .env
+$SUDO sed -i "s|OPENALGO_PLACEHOLDER_API_KEY_PEPPER_REGENERATE_BEFORE_USE|$API_KEY_PEPPER|g" .env
+
+# Container is published only on 127.0.0.1:5000 with nginx in front; trust the
+# proxy's X-Forwarded-For / X-Real-IP so IP-based features see the real client.
+$SUDO sed -i "s|TRUST_PROXY_HEADERS = 'FALSE'|TRUST_PROXY_HEADERS = 'TRUE'|g" .env
+
+# .env is bind-mounted read-only into the container at /app/.env.
+# The container runs as `appuser` (UID 1000 from the Dockerfile); a
+# chmod 600 + root-owned host file would make .env unreadable to the
+# container, causing start.sh to exit with "Error: .env file not found."
+# (See https://github.com/marketcalls/openalgo/issues/960.)
+# Mode 644 keeps the file readable to UID 1000 while still scoping write
+# access to the host owner. The Docker install runs in /opt/openalgo
+# which is typically root-only directory traversal anyway, so the host
+# threat surface is small.
+$SUDO chmod 644 .env
 
 # Update XTS market data credentials if applicable
 if is_xts_broker "$BROKER_NAME"; then

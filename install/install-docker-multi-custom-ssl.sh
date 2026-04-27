@@ -831,8 +831,16 @@ for i in "${!CONF_DOMAINS[@]}"; do
         sed -i "s|YOUR_BROKER_API_SECRET|$API_SECRET|g" "$ENV_FILE"
         sed -i "s|http://127.0.0.1:5000|https://$DOMAIN|g" "$ENV_FILE"
         sed -i "s|<broker>|$BROKER|g" "$ENV_FILE"
-        sed -i "s|3daa0403ce2501ee7432b75bf100048e3cf510d63d2754f952e93d88bf07ea84|$APP_KEY|g" "$ENV_FILE"
-        sed -i "s|a25d94718479b170c16278e321ea6c989358bf499a658fd20c90033cef8ce772|$PEPPER|g" "$ENV_FILE"
+        sed -i "s|OPENALGO_PLACEHOLDER_APP_KEY_REGENERATE_BEFORE_USE|$APP_KEY|g" "$ENV_FILE"
+        sed -i "s|OPENALGO_PLACEHOLDER_API_KEY_PEPPER_REGENERATE_BEFORE_USE|$PEPPER|g" "$ENV_FILE"
+        # Each instance is published only on 127.0.0.1 with nginx in front;
+        # trust the proxy's X-Forwarded-For / X-Real-IP.
+        sed -i "s|TRUST_PROXY_HEADERS = 'FALSE'|TRUST_PROXY_HEADERS = 'TRUE'|g" "$ENV_FILE"
+        # .env is bind-mounted read-only into the container; it must remain
+        # readable to the container's appuser (UID 1000). chmod 600 with a
+        # root-owned host file makes start.sh exit with "Error: .env file
+        # not found." See https://github.com/marketcalls/openalgo/issues/960.
+        chmod 644 "$ENV_FILE"
         
         # XTS
         if [ ! -z "$M_KEY" ]; then
