@@ -356,57 +356,61 @@ class MarginCalculatorSchema(Schema):
 def _validate_gtt_place_request(data):
     """Validate flat GTT-place fields and normalise.
 
-    SINGLE: a single trigger value is required. Callers may pass it as any of
-    ``trigger_price``, ``stoploss``, or ``target`` — whichever is non-zero is
-    used as the trigger. Direction (above/below LTP) is inferred by the broker
-    from the trigger value vs current price. ``price`` is the order's limit.
-    OCO: ``stoploss`` (stoploss trigger) + ``price`` (stoploss leg limit) and
-         ``trigger_price`` (target trigger) + ``target`` (target leg limit).
+    Field semantics:
+        ``price``            — entry/SINGLE limit price.
+        ``triggerprice_sl``  — stoploss leg trigger.
+        ``stoploss``         — stoploss leg limit price.
+        ``triggerprice_tg``  — target leg trigger.
+        ``target``           — target leg limit price.
 
-    On SINGLE the unused trigger fields are cleared so downstream consumers
-    can rely on ``trigger_price`` being the resolved trigger and stoploss/
-    target being absent.
+    SINGLE: exactly one of ``triggerprice_sl`` / ``triggerprice_tg`` must be
+    non-zero; the other is cleared. The resolved trigger is stored in
+    ``trigger_price`` (legacy alias) so downstream broker mappers stay simple.
+    OCO: all four (``triggerprice_sl``, ``stoploss``, ``triggerprice_tg``,
+    ``target``) are required, and ``triggerprice_sl < triggerprice_tg``.
     """
     trigger_type = (data.get("trigger_type") or "").upper()
     if trigger_type not in ("SINGLE", "OCO"):
         raise ValidationError({"trigger_type": ["Must be 'SINGLE' or 'OCO'."]})
     data["trigger_type"] = trigger_type
 
+    sl_trigger = data.get("triggerprice_sl")
+    tg_trigger = data.get("triggerprice_tg")
+
     if trigger_type == "OCO":
         stoploss = data.get("stoploss")
         target = data.get("target")
-        trigger_price = data.get("trigger_price")
+        if sl_trigger in (None, 0, 0.0):
+            raise ValidationError({"triggerprice_sl": ["Required for OCO (stoploss trigger)."]})
         if stoploss in (None, 0, 0.0):
-            raise ValidationError({"stoploss": ["Required for OCO (stoploss trigger price)."]})
+            raise ValidationError({"stoploss": ["Required for OCO (stoploss leg limit)."]})
+        if tg_trigger in (None, 0, 0.0):
+            raise ValidationError({"triggerprice_tg": ["Required for OCO (target trigger)."]})
         if target in (None, 0, 0.0):
-            raise ValidationError({"target": ["Required for OCO (target leg limit price)."]})
-        if trigger_price in (None, 0, 0.0):
-            raise ValidationError({"trigger_price": ["Required for OCO (target trigger price)."]})
-        if float(stoploss) >= float(trigger_price):
+            raise ValidationError({"target": ["Required for OCO (target leg limit)."]})
+        if float(sl_trigger) >= float(tg_trigger):
             raise ValidationError({
-                "stoploss": [
-                    "Stoploss trigger must be less than the target trigger (trigger_price)."
+                "triggerprice_sl": [
+                    "Stoploss trigger must be less than target trigger (triggerprice_tg)."
                 ]
             })
-    else:  # SINGLE — pick the first non-zero trigger from trigger_price / stoploss / target.
-        candidates = [
-            data.get("trigger_price"),
-            data.get("stoploss"),
-            data.get("target"),
-        ]
-        resolved = next(
-            (float(c) for c in candidates if c not in (None, 0, 0.0)),
-            None,
-        )
-        if resolved is None or resolved <= 0:
+        # Legacy alias used by broker mappers / event payloads.
+        data["trigger_price"] = float(tg_trigger)
+    else:  # SINGLE — exactly one of triggerprice_sl / triggerprice_tg is the trigger.
+        sl_v = float(sl_trigger) if sl_trigger not in (None, "", 0, 0.0) else 0.0
+        tg_v = float(tg_trigger) if tg_trigger not in (None, "", 0, 0.0) else 0.0
+        if sl_v <= 0 and tg_v <= 0:
             raise ValidationError({
-                "trigger_price": [
-                    "SINGLE GTT requires a positive trigger value via trigger_price, stoploss, or target."
+                "triggerprice_sl": [
+                    "SINGLE GTT requires a positive triggerprice_sl or triggerprice_tg."
                 ]
             })
-        data["trigger_price"] = resolved
+        resolved = sl_v if sl_v > 0 else tg_v
+        data["triggerprice_sl"] = sl_v if sl_v > 0 else None
+        data["triggerprice_tg"] = tg_v if sl_v <= 0 else None
         data["stoploss"] = None
         data["target"] = None
+        data["trigger_price"] = resolved  # legacy alias
 
     exchange = data.get("exchange")
     qty = data.get("quantity")
@@ -425,11 +429,16 @@ class PlaceGTTOrderSchema(Schema):
     """Schema for placing a GTT in the flat shape.
 
     Required fields (all GTTs): apikey, strategy, trigger_type ('SINGLE' or
-    'OCO'), exchange, symbol, action, product, quantity, pricetype, price,
-    trigger_price.
+    'OCO'), exchange, symbol, action, product, quantity, pricetype, price.
 
-    OCO-only: ``stoploss`` (stoploss trigger) and ``target`` (target leg's
-    limit price). For SINGLE these may be omitted or sent as empty strings.
+    Trigger fields:
+        ``triggerprice_sl`` — stoploss leg trigger
+        ``triggerprice_tg`` — target leg trigger
+        ``stoploss``        — stoploss leg limit (OCO only)
+        ``target``          — target leg limit (OCO only)
+
+    SINGLE: pass exactly one of triggerprice_sl / triggerprice_tg (the other
+    may be 0 or omitted). OCO: all four are required.
 
     ``last_price`` is fetched server-side from the quotes API and should not
     be sent by clients.
@@ -454,9 +463,13 @@ class PlaceGTTOrderSchema(Schema):
         required=True,
         validate=validate.Range(min=0, error="Price must be a non-negative number."),
     )
-    trigger_price = fields.Float(
+    triggerprice_sl = fields.Float(
         missing=0.0,
-        validate=validate.Range(min=0, error="Trigger price must be non-negative."),
+        validate=validate.Range(min=0, error="triggerprice_sl must be non-negative."),
+    )
+    triggerprice_tg = fields.Float(
+        missing=0.0,
+        validate=validate.Range(min=0, error="triggerprice_tg must be non-negative."),
     )
     stoploss = fields.Float(missing=None, allow_none=True)
     target = fields.Float(missing=None, allow_none=True)
@@ -465,9 +478,9 @@ class PlaceGTTOrderSchema(Schema):
     @pre_load
     def coerce_empty_to_none(self, data, **kwargs):
         if isinstance(data, dict):
-            for key in ("stoploss", "target"):
+            for key in ("stoploss", "target", "triggerprice_sl", "triggerprice_tg"):
                 if data.get(key) == "":
-                    data[key] = None
+                    data[key] = None if key in ("stoploss", "target") else 0.0
         return data
 
     @post_load
@@ -503,9 +516,13 @@ class ModifyGTTOrderSchema(Schema):
         required=True,
         validate=validate.Range(min=0, error="Price must be a non-negative number."),
     )
-    trigger_price = fields.Float(
+    triggerprice_sl = fields.Float(
         missing=0.0,
-        validate=validate.Range(min=0, error="Trigger price must be non-negative."),
+        validate=validate.Range(min=0, error="triggerprice_sl must be non-negative."),
+    )
+    triggerprice_tg = fields.Float(
+        missing=0.0,
+        validate=validate.Range(min=0, error="triggerprice_tg must be non-negative."),
     )
     stoploss = fields.Float(missing=None, allow_none=True)
     target = fields.Float(missing=None, allow_none=True)
@@ -513,9 +530,9 @@ class ModifyGTTOrderSchema(Schema):
     @pre_load
     def coerce_empty_to_none(self, data, **kwargs):
         if isinstance(data, dict):
-            for key in ("stoploss", "target"):
+            for key in ("stoploss", "target", "triggerprice_sl", "triggerprice_tg"):
                 if data.get(key) == "":
-                    data[key] = None
+                    data[key] = None if key in ("stoploss", "target") else 0.0
         return data
 
     @post_load

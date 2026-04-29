@@ -206,8 +206,10 @@ def get_gtt_book(auth):
     The returned dict has ``status`` and ``data`` where ``data`` is the
     OpenAlgo-normalised list (see :func:`map_gtt_book`).
     """
+    # Dhan's published docs say GET /v2/forever/all but their official SDK
+    # and live API use GET /v2/forever/orders. /all returns 404.
     client = get_httpx_client()
-    response = client.get(get_url("/v2/forever/all"), headers=_headers(auth))
+    response = client.get(get_url("/v2/forever/orders"), headers=_headers(auth))
     logger.info(f"Dhan gtt_book raw: status={response.status_code}")
 
     try:

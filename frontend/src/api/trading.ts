@@ -323,7 +323,8 @@ export const tradingApi = {
       quantity: number
       pricetype: string
       price: number
-      trigger_price: number
+      triggerprice_sl: number
+      triggerprice_tg: number
       stoploss?: number | null
       target?: number | null
       strategy?: string

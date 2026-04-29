@@ -87,7 +87,6 @@ def modify_gtt_order_with_auth(
             "trigger_id": response_message.get("trigger_id", trigger_id)
             if isinstance(response_message, dict)
             else trigger_id,
-            "mode": "live",
         }
         bus.publish(GTTModifiedEvent(
             mode="live", api_type=API_TYPE,

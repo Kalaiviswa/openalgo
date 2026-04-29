@@ -89,12 +89,12 @@ def place_gtt_order_with_auth(
         return False, error_response, 500
 
     if res.status == 200 and trigger_id:
-        success_response = {"status": "success", "trigger_id": trigger_id, "mode": "live"}
+        success_response = {"status": "success", "trigger_id": trigger_id}
         # Derive trigger_prices for the event from the flat fields.
         if (order_data.get("trigger_type") or "").upper() == "OCO":
             event_trigger_prices = [
-                float(order_data.get("stoploss") or 0),
-                float(order_data.get("trigger_price") or 0),
+                float(order_data.get("triggerprice_sl") or 0),
+                float(order_data.get("triggerprice_tg") or 0),
             ]
         else:
             event_trigger_prices = [float(order_data.get("trigger_price") or 0)]

@@ -25,20 +25,23 @@ _STATUS_MAP = {
 def transform_place_gtt(data):
     """Transform an OpenAlgo flat place-GTT payload into Dhan's POST /forever/orders body.
 
-    SINGLE → ``triggerPrice`` + ``price`` + ``quantity`` from the flat fields.
-    OCO    → primary leg uses ``price`` + ``triggerPrice`` (= ``stoploss``);
-             target leg uses ``price1`` (= ``target``) + ``triggerPrice1``
-             (= ``trigger_price``) + ``quantity1`` (same qty).
+    SINGLE → ``triggerPrice`` (= resolved trigger) + ``price`` + ``quantity``.
+    OCO    → primary (stoploss) leg uses ``price`` (= ``stoploss``) +
+             ``triggerPrice`` (= ``triggerprice_sl``); target leg uses
+             ``price1`` (= ``target``) + ``triggerPrice1``
+             (= ``triggerprice_tg``) + ``quantity1`` (same qty).
 
     Caller must populate ``data['dhan_client_id']`` before calling.
     """
     security_id = get_token(data["symbol"], data["exchange"])
     trigger_type = (data.get("trigger_type") or "").upper()  # SINGLE | OCO
 
-    # For OCO the primary leg is the stoploss leg (lower trigger).
-    primary_trigger = (
-        float(data["trigger_price"]) if trigger_type == "SINGLE" else float(data["stoploss"])
-    )
+    if trigger_type == "SINGLE":
+        primary_trigger = float(data["trigger_price"])
+        primary_price = float(data["price"])
+    else:  # OCO — primary leg = stoploss
+        primary_trigger = float(data["triggerprice_sl"])
+        primary_price = float(data["stoploss"])
 
     body = {
         "dhanClientId": str(data["dhan_client_id"]),
@@ -50,13 +53,13 @@ def transform_place_gtt(data):
         "validity": "DAY",
         "securityId": str(security_id),
         "quantity": int(data["quantity"]),
-        "price": float(data["price"]),
+        "price": primary_price,
         "triggerPrice": primary_trigger,
     }
 
     if trigger_type == "OCO":
         body["price1"] = float(data["target"])
-        body["triggerPrice1"] = float(data["trigger_price"])
+        body["triggerPrice1"] = float(data["triggerprice_tg"])
         body["quantity1"] = int(data["quantity"])
 
     # OpenAlgo's ``strategy`` doubles as Dhan's correlationId (max 30 chars).
@@ -72,9 +75,9 @@ def transform_modify_gtt(data, leg_name):
 
     Dhan modifies one leg at a time. ``leg_name`` selects which slice of the
     flat fields drives the body:
-        - ``ENTRY_LEG`` (SINGLE) → ``trigger_price`` + ``price``.
-        - ``STOP_LOSS_LEG`` (OCO) → ``stoploss`` + ``price``.
-        - ``TARGET_LEG``    (OCO) → ``trigger_price`` + ``target``.
+        - ``ENTRY_LEG``    (SINGLE) → ``trigger_price`` + ``price``.
+        - ``STOP_LOSS_LEG`` (OCO)   → ``triggerprice_sl`` + ``stoploss``.
+        - ``TARGET_LEG``    (OCO)   → ``triggerprice_tg`` + ``target``.
 
     Caller is responsible for invoking this once for SINGLE and twice for OCO.
     """
@@ -82,10 +85,10 @@ def transform_modify_gtt(data, leg_name):
 
     if leg_name == "TARGET_LEG":
         leg_price = float(data["target"])
-        leg_trigger = float(data["trigger_price"])
+        leg_trigger = float(data["triggerprice_tg"])
     elif leg_name == "STOP_LOSS_LEG":
-        leg_price = float(data["price"])
-        leg_trigger = float(data["stoploss"])
+        leg_price = float(data["stoploss"])
+        leg_trigger = float(data["triggerprice_sl"])
     else:  # ENTRY_LEG — SINGLE has only one leg
         leg_price = float(data["price"])
         leg_trigger = float(data["trigger_price"])
@@ -104,7 +107,7 @@ def transform_modify_gtt(data, leg_name):
 
 
 def map_gtt_book(gtt_list):
-    """Normalise Dhan's GET /forever/all response into an OpenAlgo-shaped list.
+    """Normalise Dhan's GET /forever/orders response into an OpenAlgo-shaped list.
 
     Dhan returns a flat list of legs (one row per leg). SINGLE has one leg
     (``ENTRY_LEG``); OCO has two (``STOP_LOSS_LEG`` + ``TARGET_LEG``) sharing

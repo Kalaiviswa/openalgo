@@ -828,7 +828,8 @@ def modify_gtt_order_ui():
             "quantity": data.get("quantity"),
             "pricetype": data.get("pricetype", "LIMIT"),
             "price": data.get("price"),
-            "trigger_price": data.get("trigger_price"),
+            "triggerprice_sl": data.get("triggerprice_sl"),
+            "triggerprice_tg": data.get("triggerprice_tg"),
             "stoploss": data.get("stoploss"),
             "target": data.get("target"),
         }

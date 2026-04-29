@@ -45,12 +45,13 @@ interface ModifyForm {
   product: string
   pricetype: string
   quantity: number
-  // SINGLE: the trigger and limit price.
-  // OCO: target trigger and stoploss-leg's limit price (paired with stoploss/target below).
-  trigger_price: number
+  // SINGLE: entry/limit price; for OCO this is unused (each leg has its own limit).
   price: number
-  // OCO-only.
+  // Stoploss leg trigger + limit (OCO uses both; SINGLE may use triggerprice_sl alone).
+  triggerprice_sl: number
   stoploss: number
+  // Target leg trigger + limit (OCO uses both; SINGLE may use triggerprice_tg alone).
+  triggerprice_tg: number
   target: number
 }
 
@@ -178,11 +179,12 @@ export default function GttTab() {
       product: String(firstLeg.product || 'CNC'),
       pricetype: String(firstLeg.pricetype || 'LIMIT'),
       quantity: Number(firstLeg.quantity) || 0,
-      // SINGLE: the only leg's trigger + limit. OCO: target trigger + stoploss-leg limit.
-      trigger_price: Number(gtt.trigger_prices[isOco ? 1 : 0] ?? 0),
       price: Number(firstLeg.price) || 0,
-      // OCO-only.
-      stoploss: isOco ? Number(gtt.trigger_prices[0] ?? 0) : 0,
+      // OCO leg ordering matches Kite's ascending trigger_values: [stoploss_leg, target_leg].
+      // SINGLE: only one of triggerprice_sl/triggerprice_tg is used (heuristic: index 0).
+      triggerprice_sl: isOco ? Number(gtt.trigger_prices[0] ?? 0) : Number(gtt.trigger_prices[0] ?? 0),
+      stoploss: isOco ? Number(firstLeg.price) || 0 : 0,
+      triggerprice_tg: isOco ? Number(gtt.trigger_prices[1] ?? 0) : 0,
       target: isOco ? Number(targetLeg.price) || 0 : 0,
     })
     setModifyOpen(true)
@@ -190,16 +192,26 @@ export default function GttTab() {
 
   const saveModify = async () => {
     if (!modifyingGtt || !modifyForm) return
-    if (modifyForm.trigger_price <= 0 || modifyForm.quantity <= 0 || modifyForm.price < 0) {
-      showToast.error('Trigger price, quantity, and limit price must be positive', 'orders')
+    if (modifyForm.quantity <= 0 || modifyForm.price < 0) {
+      showToast.error('Quantity and limit price must be positive', 'orders')
       return
     }
-    if (modifyForm.trigger_type === 'OCO') {
-      if (modifyForm.stoploss <= 0 || modifyForm.target <= 0) {
-        showToast.error('Stoploss trigger and target limit are required for OCO', 'orders')
+    if (modifyForm.trigger_type === 'SINGLE') {
+      if (modifyForm.triggerprice_sl <= 0 && modifyForm.triggerprice_tg <= 0) {
+        showToast.error('triggerprice_sl or triggerprice_tg is required for SINGLE', 'orders')
         return
       }
-      if (modifyForm.stoploss >= modifyForm.trigger_price) {
+    } else {
+      if (
+        modifyForm.triggerprice_sl <= 0 ||
+        modifyForm.triggerprice_tg <= 0 ||
+        modifyForm.stoploss <= 0 ||
+        modifyForm.target <= 0
+      ) {
+        showToast.error('All four (triggerprice_sl, stoploss, triggerprice_tg, target) are required for OCO', 'orders')
+        return
+      }
+      if (modifyForm.triggerprice_sl >= modifyForm.triggerprice_tg) {
         showToast.error('Stoploss trigger must be less than target trigger', 'orders')
         return
       }
@@ -216,7 +228,8 @@ export default function GttTab() {
         pricetype: modifyForm.pricetype,
         quantity: modifyForm.quantity,
         price: modifyForm.price,
-        trigger_price: modifyForm.trigger_price,
+        triggerprice_sl: modifyForm.triggerprice_sl,
+        triggerprice_tg: modifyForm.triggerprice_tg,
         stoploss: modifyForm.trigger_type === 'OCO' ? modifyForm.stoploss : null,
         target: modifyForm.trigger_type === 'OCO' ? modifyForm.target : null,
         strategy: 'GTT Modify',
@@ -538,11 +551,11 @@ export default function GttTab() {
                         <Input
                           type="number"
                           step="0.05"
-                          value={modifyForm.trigger_price}
+                          value={modifyForm.triggerprice_sl}
                           onChange={(e) =>
                             setModifyForm({
                               ...modifyForm,
-                              trigger_price: parseFloat(e.target.value) || 0,
+                              triggerprice_sl: parseFloat(e.target.value) || 0,
                             })
                           }
                         />
@@ -569,6 +582,20 @@ export default function GttTab() {
                         <Input
                           type="number"
                           step="0.05"
+                          value={modifyForm.triggerprice_sl}
+                          onChange={(e) =>
+                            setModifyForm({
+                              ...modifyForm,
+                              triggerprice_sl: parseFloat(e.target.value) || 0,
+                            })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-xs">Stoploss Limit</Label>
+                        <Input
+                          type="number"
+                          step="0.05"
                           value={modifyForm.stoploss}
                           onChange={(e) =>
                             setModifyForm({
@@ -579,29 +606,15 @@ export default function GttTab() {
                         />
                       </div>
                       <div>
-                        <Label className="text-xs">Stoploss Limit</Label>
-                        <Input
-                          type="number"
-                          step="0.05"
-                          value={modifyForm.price}
-                          onChange={(e) =>
-                            setModifyForm({
-                              ...modifyForm,
-                              price: parseFloat(e.target.value) || 0,
-                            })
-                          }
-                        />
-                      </div>
-                      <div>
                         <Label className="text-xs">Target Trigger</Label>
                         <Input
                           type="number"
                           step="0.05"
-                          value={modifyForm.trigger_price}
+                          value={modifyForm.triggerprice_tg}
                           onChange={(e) =>
                             setModifyForm({
                               ...modifyForm,
-                              trigger_price: parseFloat(e.target.value) || 0,
+                              triggerprice_tg: parseFloat(e.target.value) || 0,
                             })
                           }
                         />

@@ -22,13 +22,14 @@ def transform_place_gtt(data):
 
     Expected ``data`` keys (post-schema):
         symbol, exchange, trigger_type ("SINGLE" | "OCO"), action, product,
-        quantity, pricetype, price, trigger_price, last_price, and for OCO
-        also stoploss + target.
+        quantity, pricetype, price, last_price, and:
+        - SINGLE → trigger_price (legacy alias resolved by the schema).
+        - OCO    → triggerprice_sl + stoploss + triggerprice_tg + target.
 
     Mapping:
         SINGLE → trigger=trigger_price, limit=price.
-        OCO    → stoploss leg (trigger=stoploss, limit=price) +
-                 target leg   (trigger=trigger_price, limit=target).
+        OCO    → stoploss leg (trigger=triggerprice_sl, limit=stoploss) +
+                 target   leg (trigger=triggerprice_tg, limit=target).
                  trigger_values is sorted low→high as Kite requires.
 
     Caller is responsible for JSON-encoding ``condition`` and ``orders`` and
@@ -40,9 +41,9 @@ def transform_place_gtt(data):
 
     if trigger_type_oa == "OCO":
         kite_type = "two-leg"
-        trigger_values = [float(data["stoploss"]), float(data["trigger_price"])]
+        trigger_values = [float(data["triggerprice_sl"]), float(data["triggerprice_tg"])]
         orders = [
-            _build_order(data, data["price"], tradingsymbol, exchange),
+            _build_order(data, data["stoploss"], tradingsymbol, exchange),
             _build_order(data, data["target"], tradingsymbol, exchange),
         ]
     else:  # SINGLE
