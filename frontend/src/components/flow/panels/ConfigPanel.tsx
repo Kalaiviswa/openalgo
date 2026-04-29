@@ -197,8 +197,9 @@ export function ConfigPanel() {
         </div>
       </div>
 
-      <ScrollArea className="flex-1 min-h-0">
-        <div className="space-y-4 p-4">
+      <div className="flex-1 min-h-0">
+        <ScrollArea className="h-full">
+          <div className="space-y-4 p-4">
 
           {/* ===== SCHEDULE/START ===== */}
           {nodeType === 'start' && (<>
@@ -372,6 +373,7 @@ export function ConfigPanel() {
           {nodeType === 'expiry' && (<>
             <div className="space-y-2"><Label className="text-xs">Symbol</Label><Input className="h-8" placeholder="NIFTY" value={(nodeData.symbol as string) || ''} onChange={(e) => handleDataChange('symbol', e.target.value)} /></div>
             <div className="space-y-2"><Label className="text-xs">Exchange</Label><Select value={(nodeData.exchange as string) || 'NFO'} onValueChange={(v) => handleDataChange('exchange', v)}><SelectTrigger className="h-8"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="NFO">NFO</SelectItem><SelectItem value="BFO">BFO</SelectItem><SelectItem value="MCX">MCX</SelectItem><SelectItem value="CDS">CDS</SelectItem></SelectContent></Select></div>
+            <div className="space-y-2"><Label className="text-xs">Instrument Type</Label><Select value={(nodeData.instrumenttype as string) || 'options'} onValueChange={(v) => handleDataChange('instrumenttype', v)}><SelectTrigger className="h-8"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="options">Options</SelectItem><SelectItem value="futures">Futures</SelectItem></SelectContent></Select><p className="text-[10px] text-muted-foreground">Futures and options have different expiry calendars</p></div>
             <div className="space-y-2"><Label className="text-xs">Output Variable</Label><Input className="h-8" placeholder="expiries" value={(nodeData.outputVariable as string) || ''} onChange={(e) => handleDataChange('outputVariable', e.target.value)} /><p className="text-[10px] text-muted-foreground">Use {`{{expiries.data[0]}}`}</p></div>
           </>)}
 
@@ -559,8 +561,9 @@ export function ConfigPanel() {
 
           <Separator />
           <div className="space-y-2"><Label className="text-xs text-muted-foreground">Node ID</Label><code className="block text-[10px] bg-muted px-2 py-1 rounded font-mono">{selectedNode.id}</code></div>
-        </div>
-      </ScrollArea>
+          </div>
+        </ScrollArea>
+      </div>
     </div>
   )
 }

@@ -11,6 +11,8 @@ from collections import defaultdict
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 
+from database.token_db import get_br_symbol
+
 from .fyers_hsm_websocket import FyersHSMWebSocket
 from .fyers_mapping import FyersDataMapper
 from .fyers_token_converter import FyersTokenConverter
@@ -214,51 +216,60 @@ class FyersAdapter:
                     self.logger.error("No valid HSM tokens generated")
                     return False
 
-                # CRITICAL FIX: Ensure proper HSM token mapping
-                # The tokens are generated in the same order as valid_symbols
-                self.logger.debug(f"\nCreating HSM mappings for {len(hsm_tokens)} tokens...")
-                self.logger.debug(f"HSM Tokens: {hsm_tokens}")
-                valid_symbol_list = [f"{s['exchange']}:{s['symbol']}" for s in valid_symbols]
-                self.logger.debug(f"Valid Symbols: {valid_symbol_list}")
+                # Build the HSM<->OpenAlgo mapping by JOINING through brsymbol.
+                #
+                # The previous implementation paired hsm_tokens[i] with
+                # valid_symbols[i] positionally, on the assumption that Fyers'
+                # /data/symbol-token API preserves input order in its
+                # `validSymbol` response. It DOES NOT reliably preserve order
+                # — especially when index + options are mixed in one call —
+                # so the pairing got scrambled. The visible symptom: NIFTY
+                # spot LTP showed an option's premium, far-OTM strikes showed
+                # NIFTY's bid/ask, and CE/PE rows appeared swapped.
+                #
+                # `token_mappings` is correctly keyed per-token (hsm_token ->
+                # brsymbol). Building a brsymbol -> (exchange, symbol) reverse
+                # map from valid_symbols lets us recover the correct OpenAlgo
+                # identity for each HSM token regardless of API ordering.
+                self.logger.debug(f"Creating HSM mappings for {len(hsm_tokens)} tokens...")
 
-                # Primary mapping strategy: Map by order (most reliable)
-                # Since convert_openalgo_symbols_to_hsm processes symbols in order
-                for i, hsm_token in enumerate(hsm_tokens):
-                    if i < len(valid_symbols):
-                        symbol_info = valid_symbols[i]
-                        full_symbol = f"{symbol_info['exchange']}:{symbol_info['symbol']}"
+                brsymbol_to_openalgo: dict[str, tuple[str, str]] = {}
+                for s in valid_symbols:
+                    br = get_br_symbol(s["symbol"], s["exchange"])
+                    if br:
+                        brsymbol_to_openalgo[br] = (s["exchange"], s["symbol"])
 
-                        # Store bidirectional mappings
-                        self.symbol_to_hsm[full_symbol] = hsm_token
-                        self.hsm_to_symbol[hsm_token] = full_symbol
-
-                        # Get brsymbol for logging
-                        brsymbol = token_mappings.get(hsm_token, "N/A")
-                        self.logger.debug(f"✅ Mapped #{i + 1}: {full_symbol} <-> {hsm_token}")
-                        self.logger.debug(f"   Brsymbol: {brsymbol}")
-
-                # Verify all active subscriptions have mappings
-                unmapped_subs = []
-                for full_symbol in self.active_subscriptions:
-                    if full_symbol not in self.symbol_to_hsm:
-                        unmapped_subs.append(full_symbol)
-                        self.logger.warning(f"⚠️ Unmapped subscription: {full_symbol}")
-
-                # If there are unmapped subscriptions and unused tokens, map them
-                if unmapped_subs:
-                    unused_tokens = [t for t in hsm_tokens if t not in self.hsm_to_symbol]
-                    if unused_tokens:
-                        self.logger.debug(
-                            f"Attempting to map {len(unmapped_subs)} unmapped subscriptions..."
+                mapped_count = 0
+                for hsm_token in hsm_tokens:
+                    brsym = token_mappings.get(hsm_token)
+                    if not brsym:
+                        self.logger.warning(
+                            f"No brsymbol in token_mappings for HSM token {hsm_token}"
                         )
-                        for i, full_symbol in enumerate(unmapped_subs):
-                            if i < len(unused_tokens):
-                                hsm_token = unused_tokens[i]
-                                self.symbol_to_hsm[full_symbol] = hsm_token
-                                self.hsm_to_symbol[hsm_token] = full_symbol
-                                self.logger.debug(
-                                    f"✅ Recovery mapped: {full_symbol} <-> {hsm_token}"
-                                )
+                        continue
+                    pair = brsymbol_to_openalgo.get(brsym)
+                    if not pair:
+                        self.logger.warning(
+                            f"brsymbol {brsym} did not match any input symbol"
+                        )
+                        continue
+                    exch, sym = pair
+                    full_symbol = f"{exch}:{sym}"
+                    self.symbol_to_hsm[full_symbol] = hsm_token
+                    self.hsm_to_symbol[hsm_token] = full_symbol
+                    mapped_count += 1
+                    self.logger.debug(
+                        f"Mapped {full_symbol} <-> {hsm_token} (brsymbol: {brsym})"
+                    )
+
+                # Sanity check: every input symbol should have ended up mapped.
+                unmapped_subs = [
+                    f"{s['exchange']}:{s['symbol']}"
+                    for s in valid_symbols
+                    if f"{s['exchange']}:{s['symbol']}" not in self.symbol_to_hsm
+                ]
+                for fs in unmapped_subs:
+                    self.logger.warning(f"Unmapped subscription: {fs}")
 
                 # Final verification
                 self.logger.debug("\n📊 Mapping Summary:")
@@ -471,69 +482,78 @@ class FyersAdapter:
             # This follows the same pattern as Angel adapter which uses token-based matching
             """
 
-            # Get the appropriate callback for this specific symbol
+            # Build the list of callbacks to invoke for this tick.
+            #
+            # Stocks have two distinct HSM streams — `sf` (symbol feed → quote)
+            # and `dp` (depth feed) — and each tick belongs to exactly one
+            # subscriber. Indices have a SINGLE feed (`if`), so a single tick
+            # may need to be fanned out to both Quote (mode 2) and Depth
+            # (mode 3) subscribers when both are registered. Previously this
+            # branch only delivered to whichever callback existed, with Depth
+            # winning when both did — so a Quote-only subscriber that ran
+            # alongside any prior Depth registration silently received
+            # depth-shaped data labelled `subscription_mode: 3`. See issue
+            # #1093.
             full_symbol = f"{matched_subscription['exchange']}:{matched_subscription['symbol']}"
+            quote_cb = self.subscription_callbacks.get(f"SymbolUpdate_{full_symbol}")
+            depth_cb = self.subscription_callbacks.get(f"DepthUpdate_{full_symbol}")
 
+            dispatches: list[tuple[Callable, str]] = []
             if fyers_type == "dp":
-                callback = self.subscription_callbacks.get(f"DepthUpdate_{full_symbol}")
-                openalgo_data_type = "Depth"
+                if depth_cb:
+                    dispatches.append((depth_cb, "Depth"))
             elif fyers_type == "if":
-                # Check if we have depth subscription for this symbol
-                depth_callback = self.subscription_callbacks.get(f"DepthUpdate_{full_symbol}")
-                if depth_callback:
-                    callback = depth_callback
-                    openalgo_data_type = "Depth"
-                else:
-                    callback = self.subscription_callbacks.get(f"SymbolUpdate_{full_symbol}")
-                    openalgo_data_type = "Quote"
+                # Index feed: fan out to whichever sides are subscribed.
+                if quote_cb:
+                    dispatches.append((quote_cb, "Quote"))
+                if depth_cb:
+                    dispatches.append((depth_cb, "Depth"))
             else:
-                callback = self.subscription_callbacks.get(f"SymbolUpdate_{full_symbol}")
-                openalgo_data_type = "Quote"
+                if quote_cb:
+                    dispatches.append((quote_cb, "Quote"))
 
-            if not callback:
+            if not dispatches:
                 return
 
-            # Re-map data with correct type if needed
-            if openalgo_data_type == "Depth":
-                mapped_data = self.data_mapper.map_fyers_data(fyers_data, "Depth")
-                if not mapped_data:
-                    return
-
-            # Override symbol and exchange with subscription details to ensure consistency
-            mapped_data["symbol"] = matched_subscription["symbol"]
-            mapped_data["exchange"] = matched_subscription["exchange"]
-            mapped_data["update_type"] = update_type
-            mapped_data["timestamp"] = int(time.time())
-
-            # Deduplication check
-            symbol_key = f"{matched_subscription['exchange']}:{matched_subscription['symbol']}"
+            # Deduplicate ONCE at the symbol level so we don't drop the second
+            # fan-out leg just because the first leg already updated last_data.
+            symbol_key = full_symbol
+            now = int(time.time())
             current_ltp = mapped_data.get("ltp", 0)
-
-            # Check if this is duplicate data
             if symbol_key in self.last_data:
                 last_ltp = self.last_data[symbol_key].get("ltp", 0)
                 last_time = self.last_data[symbol_key].get("timestamp", 0)
-
-                # Skip if same LTP within 100ms (likely duplicate)
-                if current_ltp == last_ltp and abs(mapped_data["timestamp"] - last_time) < 0.1:
+                if current_ltp == last_ltp and abs(now - last_time) < 0.1:
                     return
+            self.last_data[symbol_key] = {"ltp": current_ltp, "timestamp": now}
 
-            # Update last data for deduplication
-            self.last_data[symbol_key] = {"ltp": current_ltp, "timestamp": mapped_data["timestamp"]}
+            for cb, openalgo_data_type in dispatches:
+                # Re-map per side. The Quote map already happened above; only
+                # rebuild for Depth to keep the cost of equity/futures (the
+                # common case, single dispatch) unchanged.
+                if openalgo_data_type == "Depth":
+                    side_data = self.data_mapper.map_fyers_data(fyers_data, "Depth")
+                    if not side_data:
+                        continue
+                else:
+                    side_data = dict(mapped_data)
 
-            # Debug logging
-            if openalgo_data_type == "Depth":
-                depth = mapped_data.get("depth", {})
-                buy_levels = depth.get("buy", [])
-                sell_levels = depth.get("sell", [])
-                bid1 = buy_levels[0]["price"] if buy_levels else "N/A"
-                ask1 = sell_levels[0]["price"] if sell_levels else "N/A"
-                self.logger.debug(f"🎉 {full_symbol} depth: Bid={bid1}, Ask={ask1}")
-            else:
-                self.logger.debug(f"🎉 {full_symbol} data: LTP={mapped_data.get('ltp', 0)}")
+                side_data["symbol"] = matched_subscription["symbol"]
+                side_data["exchange"] = matched_subscription["exchange"]
+                side_data["update_type"] = update_type
+                side_data["timestamp"] = now
 
-            # Send to symbol-specific callback
-            callback(mapped_data)
+                if openalgo_data_type == "Depth":
+                    depth = side_data.get("depth", {})
+                    buy_levels = depth.get("buy", [])
+                    sell_levels = depth.get("sell", [])
+                    bid1 = buy_levels[0]["price"] if buy_levels else "N/A"
+                    ask1 = sell_levels[0]["price"] if sell_levels else "N/A"
+                    self.logger.debug(f"🎉 {full_symbol} depth: Bid={bid1}, Ask={ask1}")
+                else:
+                    self.logger.debug(f"🎉 {full_symbol} data: LTP={side_data.get('ltp', 0)}")
+
+                cb(side_data)
 
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
