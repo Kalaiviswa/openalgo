@@ -95,7 +95,13 @@ def map_gtt_book(gtt_data):
     data = gtt_data.get("data") or []
     normalised = []
 
+    # Active-only filter: drop triggered/disabled/expired/cancelled/rejected/
+    # deleted at the broker mapper so the orderbook UI shows only triggers
+    # that can still fire. Kite's GTT statuses: active, triggered, disabled,
+    # expired, cancelled, rejected, deleted.
     for gtt in data:
+        if (gtt.get("status") or "").lower() != "active":
+            continue
         condition = gtt.get("condition") or {}
         orders = gtt.get("orders") or []
         exchange = condition.get("exchange", "")

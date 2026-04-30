@@ -136,10 +136,16 @@ def map_gtt_book(gtt_list):
     if not isinstance(gtt_list, list):
         return []
 
+    # Active-only filter: drop TRADED/EXPIRED/CANCELLED/REJECTED at the broker
+    # mapper so the orderbook UI shows only triggers that can still fire.
+    _ACTIVE_RAW = {"TRANSIT", "PENDING", "CONFIRM"}
+
     grouped = {}
     for item in gtt_list:
         oid = str(item.get("orderId", "") or "")
         if not oid:
+            continue
+        if (item.get("orderStatus") or "").upper() not in _ACTIVE_RAW:
             continue
         grouped.setdefault(oid, []).append(item)
 
