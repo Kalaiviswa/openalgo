@@ -22,6 +22,17 @@ _STATUS_MAP = {
 }
 
 
+def _resolve_single_trigger(data):
+    """For SINGLE GTT, resolve the active trigger from new fields if the legacy
+    ``trigger_price`` alias was not pre-populated by the schema (e.g., the UI
+    modify route bypasses schema)."""
+    if data.get("trigger_price") not in (None, "", 0, 0.0):
+        return float(data["trigger_price"])
+    sl = data.get("triggerprice_sl") or 0
+    tg = data.get("triggerprice_tg") or 0
+    return float(sl) if float(sl) > 0 else float(tg)
+
+
 def transform_place_gtt(data):
     """Transform an OpenAlgo flat place-GTT payload into Dhan's POST /forever/orders body.
 
@@ -37,7 +48,7 @@ def transform_place_gtt(data):
     trigger_type = (data.get("trigger_type") or "").upper()  # SINGLE | OCO
 
     if trigger_type == "SINGLE":
-        primary_trigger = float(data["trigger_price"])
+        primary_trigger = _resolve_single_trigger(data)
         primary_price = float(data["price"])
     else:  # OCO — primary leg = stoploss
         primary_trigger = float(data["triggerprice_sl"])
@@ -73,25 +84,32 @@ def transform_place_gtt(data):
 def transform_modify_gtt(data, leg_name):
     """Transform an OpenAlgo modify-GTT payload into Dhan's PUT /forever/orders/{id} body.
 
-    Dhan modifies one leg at a time. ``leg_name`` selects which slice of the
-    flat fields drives the body:
-        - ``ENTRY_LEG``    (SINGLE) → ``trigger_price`` + ``price``.
-        - ``STOP_LOSS_LEG`` (OCO)   → ``triggerprice_sl`` + ``stoploss``.
-        - ``TARGET_LEG``    (OCO)   → ``triggerprice_tg`` + ``target``.
+    Dhan modifies one leg at a time. Field semantics dispatch by
+    ``trigger_type`` (the OpenAlgo flag), not by ``leg_name`` — Dhan's leg
+    labels for SINGLE orders can be ENTRY_LEG / STOP_LOSS_LEG / TARGET_LEG
+    depending on the action+trigger relationship to LTP at place-time, but
+    for OpenAlgo a SINGLE always carries its values in ``price`` and the
+    resolved trigger.
 
-    Caller is responsible for invoking this once for SINGLE and twice for OCO.
+        - SINGLE (any leg_name) → ``price`` + resolved trigger.
+        - OCO + STOP_LOSS_LEG  → ``stoploss`` + ``triggerprice_sl``.
+        - OCO + TARGET_LEG     → ``target``   + ``triggerprice_tg``.
+
+    ``leg_name`` is forwarded as Dhan's API tag so the PUT targets the right
+    leg.
     """
     trigger_type = (data.get("trigger_type") or "").upper()
 
-    if leg_name == "TARGET_LEG":
-        leg_price = float(data["target"])
-        leg_trigger = float(data["triggerprice_tg"])
-    elif leg_name == "STOP_LOSS_LEG":
-        leg_price = float(data["stoploss"])
-        leg_trigger = float(data["triggerprice_sl"])
-    else:  # ENTRY_LEG — SINGLE has only one leg
+    if trigger_type == "OCO":
+        if leg_name == "TARGET_LEG":
+            leg_price = float(data["target"])
+            leg_trigger = float(data["triggerprice_tg"])
+        else:  # STOP_LOSS_LEG
+            leg_price = float(data["stoploss"])
+            leg_trigger = float(data["triggerprice_sl"])
+    else:  # SINGLE — leg_name is a Dhan tag only, values come from SINGLE fields.
         leg_price = float(data["price"])
-        leg_trigger = float(data["trigger_price"])
+        leg_trigger = _resolve_single_trigger(data)
 
     return {
         "dhanClientId": str(data["dhan_client_id"]),
@@ -142,13 +160,18 @@ def map_gtt_book(gtt_list):
 
         out_legs = []
         for leg in sorted_legs:
+            leg_price = float(leg.get("price", 0) or 0)
+            # Dhan's GET response doesn't expose LIMIT/MARKET — infer from price.
+            # MARKET GTTs are stored with price=0; LIMIT GTTs carry the limit.
+            inferred_pricetype = "MARKET" if leg_price == 0 else "LIMIT"
             out_legs.append({
                 "action": (leg.get("transactionType", "") or "").upper(),
                 "quantity": leg.get("quantity", 0),
                 "price": leg.get("price", 0),
-                # Dhan's GET response doesn't include per-leg LIMIT/MARKET; default LIMIT.
-                "pricetype": "LIMIT",
+                "pricetype": inferred_pricetype,
                 "product": reverse_map_product_type(leg.get("productType", "")) or "CNC",
+                # Dhan-internal legName needed by modify (STOP_LOSS_LEG / TARGET_LEG / ENTRY_LEG).
+                "leg_name": leg.get("legName", "") or "",
             })
 
         # Dhan reuses the ``orderType`` field in the GET response for the SINGLE/OCO flag.

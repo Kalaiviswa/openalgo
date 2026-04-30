@@ -9,8 +9,10 @@ from broker.zerodha.mapping.gtt_data import (
     transform_modify_gtt,
     transform_place_gtt,
 )
+from database.token_db_enhanced import get_symbol_info
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.mpp_slab import calculate_protected_price, get_instrument_type_from_symbol
 
 logger = get_logger(__name__)
 
@@ -50,6 +52,77 @@ def _fetch_last_price(symbol, exchange, auth):
     return float(ltp) if ltp else None
 
 
+def _apply_mpp_if_market(data, last_price):
+    """Convert MARKET pricetype → MPP-protected LIMIT.
+
+    Kite GTT only accepts ``order_type=LIMIT`` (see Kite Connect v3 GTT docs),
+    so when the user requests MARKET we mirror the flattrade/shoonya pattern:
+    fetch tick_size, compute a Market-Price-Protection buffer around the
+    relevant base price, override the limit fields, and force pricetype=LIMIT.
+
+    SINGLE → buffer applied to ``last_price``; ``data["price"]`` overridden.
+    OCO    → buffer applied to each leg's trigger price; ``data["stoploss"]``
+             and ``data["target"]`` overridden (action determines buy/sell
+             direction for both legs).
+    """
+    if (data.get("pricetype") or "").upper() != "MARKET":
+        return
+
+    action = (data.get("action") or "").upper()
+    symbol = data.get("symbol")
+    exchange = data.get("exchange")
+
+    sym_info = get_symbol_info(symbol, exchange) if symbol and exchange else None
+    tick_size = getattr(sym_info, "tick_size", None) if sym_info else None
+    instrument_type = (
+        getattr(sym_info, "instrumenttype", None) if sym_info else None
+    ) or get_instrument_type_from_symbol(symbol or "")
+
+    trigger_type = (data.get("trigger_type") or "").upper()
+
+    if trigger_type == "OCO":
+        sl_trigger = float(data.get("triggerprice_sl") or 0)
+        tg_trigger = float(data.get("triggerprice_tg") or 0)
+        if sl_trigger > 0:
+            data["stoploss"] = calculate_protected_price(
+                price=sl_trigger,
+                action=action,
+                symbol=symbol,
+                instrument_type=instrument_type,
+                tick_size=tick_size,
+            )
+        if tg_trigger > 0:
+            data["target"] = calculate_protected_price(
+                price=tg_trigger,
+                action=action,
+                symbol=symbol,
+                instrument_type=instrument_type,
+                tick_size=tick_size,
+            )
+    else:
+        if last_price and last_price > 0:
+            data["price"] = calculate_protected_price(
+                price=float(last_price),
+                action=action,
+                symbol=symbol,
+                instrument_type=instrument_type,
+                tick_size=tick_size,
+            )
+        else:
+            logger.warning(
+                f"MPP: no last_price available for {symbol}@{exchange}; "
+                f"sending raw price={data.get('price')} as LIMIT"
+            )
+
+    data["pricetype"] = "LIMIT"
+    logger.info(
+        f"Zerodha GTT MARKET→LIMIT: trigger_type={trigger_type}, action={action}, "
+        f"symbol={symbol}, instrument_type={instrument_type}, tick_size={tick_size}, "
+        f"price={data.get('price')}, stoploss={data.get('stoploss')}, "
+        f"target={data.get('target')}"
+    )
+
+
 def place_gtt_order(data, auth):
     """Create a GTT on Zerodha. Returns (response, response_dict, trigger_id).
 
@@ -69,6 +142,8 @@ def place_gtt_order(data, auth):
                 None,
             )
         data["last_price"] = ltp
+
+    _apply_mpp_if_market(data, data.get("last_price"))
 
     transformed = transform_place_gtt(data)
     body = _encode_gtt_payload(transformed)
@@ -105,6 +180,8 @@ def modify_gtt_order(data, auth):
         if not ltp:
             return {"status": "error", "message": "Failed to fetch last_price from Zerodha quotes"}, 502
         data["last_price"] = ltp
+
+    _apply_mpp_if_market(data, data.get("last_price"))
 
     transformed = transform_modify_gtt(data)
     body = _encode_gtt_payload(transformed)

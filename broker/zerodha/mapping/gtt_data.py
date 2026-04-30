@@ -17,6 +17,17 @@ def _build_order(data, price, tradingsymbol, exchange):
     }
 
 
+def _resolve_single_trigger(data):
+    """For SINGLE GTT, resolve the active trigger from new fields if the legacy
+    ``trigger_price`` alias was not pre-populated by the schema (e.g., the UI
+    modify route bypasses schema)."""
+    if data.get("trigger_price") not in (None, "", 0, 0.0):
+        return float(data["trigger_price"])
+    sl = data.get("triggerprice_sl") or 0
+    tg = data.get("triggerprice_tg") or 0
+    return float(sl) if float(sl) > 0 else float(tg)
+
+
 def transform_place_gtt(data):
     """Transform an OpenAlgo flat place-GTT payload into Kite's `{type, condition, orders}`.
 
@@ -48,7 +59,7 @@ def transform_place_gtt(data):
         ]
     else:  # SINGLE
         kite_type = "single"
-        trigger_values = [float(data["trigger_price"])]
+        trigger_values = [_resolve_single_trigger(data)]
         orders = [_build_order(data, data["price"], tradingsymbol, exchange)]
 
     condition = {
