@@ -506,7 +506,7 @@ GTT supported on all brokers that expose a GTT-equivalent API. Brokers without n
 | Jinja | `templates/gtt_orderbook.html` | `templates/orderbook.html` |
 | Playground | 4 `.bru` files under `collections/openalgo/IN_stock/orders/` | `blueprints/playground.py` |
 | SDK | — | `src/openalgo/orders.py` (or client module) |
-| Docs | `docs/api/order-management/{placegttorder,modifygttorder,cancelgttorder,gttorderbook}.md` + `docs/api/order-management/gitbook/{...}.md` + (Phase 5 pending) `docs/userguide/gtt-orders.md`, `docs/test/gtt-test-plan.md` | `docs/api/README.md`, root `README.md`, `CLAUDE.md`, `docs/CHANGELOG.md` |
+| Docs | `docs/api/order-management/{placegttorder,modifygttorder,cancelgttorder,gttorderbook}.md` + (Phase 5 pending) `docs/userguide/gtt-orders.md`, `docs/test/gtt-test-plan.md`. (Gitbook-ready paste copies live outside the repo at `../gitbook/`.) | `docs/api/README.md`, root `README.md`, `CLAUDE.md`, `docs/CHANGELOG.md` |
 
 ---
 
