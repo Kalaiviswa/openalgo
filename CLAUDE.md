@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It provides a unified API layer across 24+ Indian brokers, enabling seamless integration with TradingView, Amibroker, Excel, Python, and AI agents.
+OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It provides a unified API layer across 30+ Indian brokers, enabling seamless integration with TradingView, Amibroker, Excel, Python, and AI agents.
 
 **Repository**: https://github.com/marketcalls/openalgo
 **Documentation**: https://docs.openalgo.in
@@ -99,7 +99,7 @@ npm run format
 - `app.py` - Main Flask application entry point
 - `blueprints/` - Flask route handlers (UI and webhooks)
 - `restx_api/` - REST API endpoints (`/api/v1/`)
-- `broker/` - Broker integrations (24+ brokers), each with `api/`, `database/`, `mapping/`, `streaming/`, `plugin.json`
+- `broker/` - Broker integrations (30+ brokers), each with `api/`, `database/`, `mapping/`, `streaming/`, `plugin.json`
 - `services/` - Business logic layer
 - `database/` - SQLAlchemy models and database utilities
 - `utils/` - Shared utilities and helpers
@@ -134,7 +134,7 @@ Broker API calls use `httpx` with HTTP/2 connection pooling (`utils/httpx_client
 
 ### Broker Integration Pattern
 
-All 24+ brokers follow a standardized structure in `broker/{broker_name}/`:
+All 30+ brokers follow a standardized structure in `broker/{broker_name}/`:
 
 1. `api/auth_api.py` - OAuth2 or API key based authentication
 2. `api/order_api.py` - Place, modify, cancel orders
@@ -328,6 +328,52 @@ Critical variables to configure:
 - `MAX_SYMBOLS_PER_WEBSOCKET`: Symbol limit per connection
 - `FLASK_DEBUG`: Enable debug mode (development only)
 
+## Version Bumping
+
+There are **two independent versions** in this repo. Do not confuse them.
+
+### 1. Platform version (e.g. `2.0.0.6`)
+
+This is the OpenAlgo platform itself. Source of truth: `utils/version.py`. Bumping touches **two files** and regenerates the lockfile — **never** the requirements files.
+
+1. `utils/version.py` — `VERSION = "x.y.z.w"` (runtime source of truth, read by `get_version()`)
+2. `pyproject.toml` — `version = "x.y.z.w"` (line 4, package metadata)
+3. Run `uv sync` to regenerate `uv.lock` with the new version
+
+```bash
+# Example: bumping platform 2.0.0.6 → 2.0.0.7
+# 1. Edit utils/version.py     → VERSION = "2.0.0.7"
+# 2. Edit pyproject.toml line 4 → version = "2.0.0.7"
+# 3. Sync the lockfile
+uv sync
+
+# 4. Verify
+uv run python -c "from utils.version import get_version; print(get_version())"
+# → 2.0.0.7
+```
+
+The platform version surfaces in:
+- The UI footer / about page (via `get_version()`)
+- API responses that include version metadata
+- Docker image tags built by CI
+
+### 2. OpenAlgo Python SDK pin (e.g. `openalgo==1.0.49`)
+
+This is a **separate** client library published on PyPI ([`openalgo`](https://pypi.org/project/openalgo/)) that the platform uses internally. It has its own release cycle. Bumping the SDK pin touches the dependency lists, **not** `utils/version.py`:
+
+1. `pyproject.toml` — update `openalgo==X.Y.Z` in the `dependencies` list
+2. `requirements.txt` — update the `openalgo==X.Y.Z` line
+3. `requirements-nginx.txt` — update the `openalgo==X.Y.Z` line
+4. Run `uv sync` to regenerate `uv.lock`
+
+```bash
+# Example: bumping SDK 1.0.49 → 1.0.50
+# Edit the three files above, then:
+uv sync
+```
+
+**Rule of thumb:** if you are releasing OpenAlgo, bump #1. If a new SDK is on PyPI with a fix you need, bump #2. They are unrelated.
+
 ## Code Style and Conventions
 
 ### Python
@@ -364,7 +410,7 @@ API keys are generated at `/apikey` and hashed with pepper before storage.
 
 ### Symbol Format
 
-OpenAlgo uses a standardized symbol format across all 24+ brokers. Broker-specific symbols are mapped via `broker/*/mapping/` modules and stored in the `SymToken` table.
+OpenAlgo uses a standardized symbol format across all 30+ brokers. Broker-specific symbols are mapped via `broker/*/mapping/` modules and stored in the `SymToken` table.
 
 **Equity:** Just the base symbol — `INFY`, `SBIN`, `TATAMOTORS`
 
