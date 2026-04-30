@@ -453,7 +453,13 @@ class PlaceGTTOrderSchema(Schema):
     exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
     symbol = fields.Str(required=True)
     action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
-    product = fields.Str(required=True, validate=validate.OneOf(["MIS", "NRML", "CNC"]))
+    product = fields.Str(
+        required=True,
+        validate=validate.OneOf(
+            ["NRML", "CNC"],
+            error="GTT supports only CNC (delivery) or NRML (overnight F&O); MIS is intraday-only.",
+        ),
+    )
     quantity = fields.Float(
         required=True,
         validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number."),
@@ -506,7 +512,13 @@ class ModifyGTTOrderSchema(Schema):
     exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
     symbol = fields.Str(required=True)
     action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
-    product = fields.Str(required=True, validate=validate.OneOf(["MIS", "NRML", "CNC"]))
+    product = fields.Str(
+        required=True,
+        validate=validate.OneOf(
+            ["NRML", "CNC"],
+            error="GTT supports only CNC (delivery) or NRML (overnight F&O); MIS is intraday-only.",
+        ),
+    )
     quantity = fields.Float(
         required=True,
         validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number."),
