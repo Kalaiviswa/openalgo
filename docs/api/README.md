@@ -37,16 +37,10 @@ Execute and manage trading orders across all supported exchanges.
 | [CancelOrder](./order-management/cancelorder.md) | Cancel a specific order |
 | [CancelAllOrder](./order-management/cancelallorder.md) | Cancel all open orders |
 | [ClosePosition](./order-management/closeposition.md) | Close all open positions |
-
-### GTT (Good Till Triggered) Orders
-Manage trigger-based orders that fire when price crosses a level. Supports SINGLE and OCO (One-Cancels-Other) types.
-
-| Endpoint | Description |
-|----------|-------------|
-| [PlaceGTTOrder](./gtt-orders/placegttorder.md) | Place a SINGLE or OCO GTT trigger |
-| [ModifyGTTOrder](./gtt-orders/modifygttorder.md) | Modify an active GTT trigger |
-| [CancelGTTOrder](./gtt-orders/cancelgttorder.md) | Cancel an active GTT trigger |
-| [GTTOrderBook](./gtt-orders/gttorderbook.md) | List active GTT triggers |
+| [PlaceGTTOrder](./order-management/placegttorder.md) | Place a SINGLE or OCO GTT (Good Till Triggered) order |
+| [ModifyGTTOrder](./order-management/modifygttorder.md) | Modify an active GTT trigger |
+| [CancelGTTOrder](./order-management/cancelgttorder.md) | Cancel an active GTT trigger |
+| [GTTOrderBook](./order-management/gttorderbook.md) | List active GTT triggers |
 
 ### Order Information
 Query order status and position information.
