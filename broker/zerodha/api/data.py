@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+from broker.zerodha.api.transport import get_with_retry
 from broker.zerodha.database.master_contract_db import SymToken, db_session
 from database.token_db import get_br_symbol, get_oa_symbol
 from utils.httpx_client import get_httpx_client
@@ -112,7 +113,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
 
         # Make the request using the shared client
         if method.upper() == "GET":
-            response = client.get(url, headers=headers)
+            response = get_with_retry(client, url, headers)
         elif method.upper() == "POST":
             headers["Content-Type"] = "application/json"
             response = client.post(url, headers=headers, json=payload)

@@ -1,6 +1,8 @@
 # Mapping OpenAlgo API Request https://openalgo.in/docs
 # Mapping Zerodha Broking Parameters https://kite.trade/docs/connect/v3/
 
+import secrets
+
 from broker.zerodha.mapping.mcx_contract_size import to_kite_quantity
 from database.token_db import get_br_symbol
 
@@ -45,7 +47,10 @@ def transform_data(data):
         ),
         "validity": "DAY",
         "market_protection": "-1",
-        "tag": "openalgo",
+        # Unique per order, so an order whose response was lost on the way back
+        # can be found in the order book by tag (see order_api.place_order_api).
+        # Kite allows 20 alphanumeric characters: "openalgo" plus 12 hex.
+        "tag": "openalgo" + secrets.token_hex(6),
     }
 
     # Extended mapping for fields that might need conditional logic or additional processing

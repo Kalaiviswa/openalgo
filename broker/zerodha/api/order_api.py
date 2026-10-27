@@ -5,6 +5,9 @@ import threading
 import time
 import urllib.parse
 
+import httpx
+
+from broker.zerodha.api.transport import NOT_SENT_ERRORS, get_with_retry
 from broker.zerodha.mapping.mcx_contract_size import (
     McxQuantityError,
     _resolve_size,
@@ -56,7 +59,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
     try:
         # Handle different HTTP methods
         if method.upper() == "GET":
-            response = client.get(url, headers=headers)
+            response = get_with_retry(client, url, headers)
         elif method.upper() == "POST":
             if isinstance(payload, str):
                 # For form-urlencoded data
@@ -207,6 +210,53 @@ class _RejectedResponse:
         self.status_code = status
 
 
+class _RecoveredResponse(_RejectedResponse):
+    """Stands in for the response Kite sent for an order we later found by tag."""
+
+    def __init__(self, status=200):
+        super().__init__(status)
+
+
+# Kite can take a moment to list a new order, so look more than once.
+_RECONCILE_ATTEMPTS = 3
+_RECONCILE_DELAY_SECONDS = 0.5
+
+
+def _find_order_by_tag(tag, auth):
+    """Return the Kite order id carrying ``tag``, or None if none is listed."""
+    for attempt in range(_RECONCILE_ATTEMPTS):
+        if attempt:
+            time.sleep(_RECONCILE_DELAY_SECONDS)
+        try:
+            orders = get_order_book(auth).get("data") or []
+        except Exception as e:
+            logger.warning(f"Order book read failed while looking for tag {tag}: {e}")
+            continue
+        for order in orders:
+            if order.get("tag") == tag or tag in (order.get("tags") or []):
+                return order.get("order_id")
+    return None
+
+
+def _reconcile_lost_order(tag, auth, exc):
+    """Answer for an order whose response was lost after it was sent."""
+    order_id = _find_order_by_tag(tag, auth)
+    if order_id:
+        logger.warning(f"Order response lost ({exc}); found order {order_id} by tag {tag}")
+        return (
+            _RecoveredResponse(),
+            {"status": "success", "data": {"order_id": order_id}},
+            order_id,
+        )
+
+    logger.error(f"Order response lost ({exc}) and tag {tag} not in the order book")
+    message = (
+        "The connection to Zerodha dropped after the order was sent, so it may "
+        "have been placed. Check the order book before placing it again."
+    )
+    return _RejectedResponse(status=502), {"status": "error", "message": message}, None
+
+
 def place_order_api(data, auth):
     AUTH_TOKEN = auth
 
@@ -251,9 +301,17 @@ def place_order_api(data, auth):
     }
 
     # Make the request using the shared client
-    response = client.post(
-        "https://api.kite.trade/orders/regular", headers=headers, content=payload_encoded
-    )
+    try:
+        response = client.post(
+            "https://api.kite.trade/orders/regular", headers=headers, content=payload_encoded
+        )
+    except NOT_SENT_ERRORS:
+        raise
+    except httpx.TransportError as exc:
+        # The order left OpenAlgo but its response was lost, so Kite may well
+        # have it (#2067, #2293). Reporting a failure here is what made callers
+        # place it a second time. Never resend it: look it up by its tag.
+        return _reconcile_lost_order(payload["tag"], auth, exc)
 
     # Log raw response
     logger.debug(f"Zerodha raw response: status={response.status_code}, body={response.text}")
