@@ -30,9 +30,17 @@ _ensure_db_directory()
 
 # Show loading indicator early (before heavy imports) so user sees immediate feedback.
 # The full banner with "Ready" status prints later, right before the server accepts connections.
+#: True only in the parent process of `python app.py` with FLASK_DEBUG on. The
+#: reloader runs there, watching files and restarting a child that serves the
+#: app; the child has WERKZEUG_RUN_MAIN set. Under gunicorn or an import the
+#: module is not __main__, so this is False and nothing changes.
+_is_reloader_parent = (
+    __name__ == "__main__"
+    and os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
+    and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
+)
+
 if __name__ == "__main__":
-    _debug = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
-    _is_reloader_parent = _debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
     if not _is_reloader_parent:
         print("\033[93mStarting OpenAlgo...\033[0m", flush=True)
 
@@ -1040,6 +1048,13 @@ def setup_environment(app):
                         logger.error(f"Failed to initialize Telegram bot: {message}")
             except Exception as e:
                 logger.error(f"Error auto-starting Telegram bot: {e}")
+
+    # The reloader parent serves nothing, so it must not run the schedulers or
+    # the bots. Starting them there too gave a second copy of every scheduler
+    # reading the same job tables: when both woke for a job at the same moment,
+    # both ran it, so a scheduled flow could place its orders twice.
+    if _is_reloader_parent:
+        return
 
     threading.Thread(target=_init_databases_and_schedulers, daemon=True).start()
 
