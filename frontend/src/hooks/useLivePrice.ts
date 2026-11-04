@@ -36,6 +36,38 @@ export interface UseLivePriceOptions {
   pauseWhenHidden?: boolean
   /** Time in ms to wait before pausing when hidden (default: 5000) */
   pauseDelay?: number
+  /**
+   * Keep the backend's P&L on open positions and move only its mark-to-market
+   * leg with the live price (default: false).
+   *
+   * Off, an open row's P&L is rebuilt as (LTP - average_price) * quantity,
+   * which is the unrealised P&L of the open quantity and nothing else. That is
+   * what the trading dock wants, since it shows realised separately.
+   *
+   * On, the row keeps the P&L the broker plugin computed - realised from
+   * earlier round trips in the same contract included - and adds
+   * quantity * (live LTP - backend LTP) * lot_size. Most brokers report a
+   * one-sided or blended average_price, so the rebuild above drops the
+   * realised P&L of a contract that was exited and re-entered the same day
+   * (issue #2266). The Positions page shows a total, so it turns this on.
+   *
+   * A row without a usable backend LTP (missing, zero or not a number) falls
+   * back to the rebuild, because the move can only be measured from the price
+   * the backend P&L was computed at.
+   */
+  preserveBackendPnl?: boolean
+}
+
+/**
+ * A positive or negative finite number from a field brokers send as a number,
+ * a numeric string, an empty string or a placeholder such as "NA".
+ *
+ * @returns The number, or null when the value is absent or not numeric.
+ */
+function finiteNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const n = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(n) ? n : null
 }
 
 /**
@@ -86,6 +118,7 @@ export function useLivePrice<T extends PriceableItem>(
     useMultiQuotesFallback = true,
     multiQuotesRefreshInterval = 30000,
     pauseWhenHidden = true,
+    preserveBackendPnl = false,
   } = options
 
   const { apiKey } = useAuthStore()
@@ -270,11 +303,31 @@ export function useLivePrice<T extends PriceableItem>(
       // This ensures cumulative P&L (realized + unrealized) is shown correctly
       const todayRealizedPnl = item.today_realized_pnl || 0
 
-      if (currentLtp && avgPrice > 0) {
-        // Contract multiplier: e.g. 0.01 for Delta Exchange ETHUSD.P (1 lot = 0.01 ETH)
-        // Defaults to 1 for all standard brokers where qty is already in underlying units
-        const lotSize = item.lot_size ?? 1
+      // Contract multiplier: e.g. 0.01 for Delta Exchange ETHUSD.P (1 lot = 0.01 ETH)
+      // Defaults to 1 for all standard brokers where qty is already in underlying units
+      const lotSize = item.lot_size ?? 1
 
+      // The price the backend P&L was computed at, and that P&L. Read through
+      // finiteNumber because brokers send both as strings, and some send a
+      // placeholder ("NA") or 0 when they have no price.
+      const backendLtp = finiteNumber(item.ltp)
+      const backendPnl = finiteNumber(item.pnl)
+
+      if (
+        preserveBackendPnl &&
+        currentLtp &&
+        backendLtp !== null &&
+        backendLtp > 0 &&
+        backendPnl !== null
+      ) {
+        // Keep the backend total (realised included) and move only the open
+        // quantity's mark-to-market with the price. When the live price is
+        // the REST price this is exactly the backend P&L.
+        calculatedPnl = backendPnl + qty * (currentLtp - backendLtp) * lotSize
+
+        const investment = Math.abs(avgPrice * qty)
+        calculatedPnlPercent = investment > 0 ? (calculatedPnl / investment) * 100 : 0
+      } else if (currentLtp && avgPrice > 0) {
         // Calculate unrealized P&L based on position direction
         // Long (qty > 0): profit when ltp > avgPrice
         // Short (qty < 0): profit when ltp < avgPrice
@@ -301,7 +354,7 @@ export function useLivePrice<T extends PriceableItem>(
         _dataSource: dataSource,
       } as T & { _dataSource: string }
     })
-  }, [items, marketData, multiQuotes, isMarketOpen, staleThreshold])
+  }, [items, marketData, multiQuotes, isMarketOpen, staleThreshold, preserveBackendPnl])
 
   return {
     data: enhancedData,

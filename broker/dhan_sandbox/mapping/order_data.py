@@ -224,13 +224,20 @@ def transform_positions_data(positions_data):
         symbol = position.get("tradingSymbol", "")
         exchange = position.get("exchangeSegment", "")
 
-        # Use broker-provided LTP fields when available, then safe fallback.
+        # Use a broker-provided last price when there is one, else leave 0.
+        #
+        # Neither the previous close nor costPrice is a last price, and both
+        # used to stand in for one here. The Positions page now keeps the
+        # backend P&L and moves it by quantity * (live LTP - this ltp), so
+        # this field must be the price the P&L below was computed at. Measuring
+        # from the cost price added the whole unrealised move a second time
+        # (issue #2266). A 0 tells the page there is no such price, and it
+        # values the row from the live price instead.
         ltp = 0.0
         for candidate in (
             position.get("ltp"),
             position.get("lastTradedPrice"),
             position.get("lastPrice"),
-            position.get("closePrice"),
         ):
             try:
                 parsed = float(candidate)
@@ -239,12 +246,6 @@ def transform_positions_data(positions_data):
             if parsed > 0:
                 ltp = parsed
                 break
-
-        if ltp <= 0:
-            try:
-                ltp = float(position.get("costPrice", 0) or 0)
-            except (TypeError, ValueError):
-                ltp = 0.0
 
         transformed_position = {
             "symbol": symbol,

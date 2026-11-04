@@ -304,16 +304,23 @@ def transform_positions_data(positions_data):
         # an upstream LTP isn't injected into the payload.
         ltp = _to_float(_first_present(row, "ltp", "lastPrice", "previousDayClose"))
 
-        # Spec exposes `realizedPnl` only. Compute MTM unrealized from netQuantity
-        # and netAveragePrice so OpenAlgo's `pnl` field reflects total P&L —
-        # but only when LTP is genuinely populated. A missing LTP defaulting
-        # to 0 would otherwise fabricate a (-average_price * quantity) loss.
+        # IIFL documents netAveragePrice as
+        #   (overnightQuantity*overnightPrice + dayBuyValue - daySellValue) / netQuantity
+        # (07-portfolio.md), a net price: every buy and sell of the day is
+        # already in it, so (ltp - netAveragePrice) * netQuantity is the whole
+        # P&L of an open position, the realised part of earlier round trips
+        # included. Adding realizedPnl on top counted that part twice once a
+        # position had been partly closed or re-entered (issue #2266).
+        #
+        # A closed row has no net price (netQuantity is 0), so realizedPnl is
+        # its P&L. An open row with no LTP keeps realizedPnl as before: a
+        # missing LTP defaulting to 0 would otherwise fabricate a
+        # (-average_price * quantity) loss.
         realized_pnl = _to_float(row.get("realizedPnl"))
         if quantity and ltp > 0:
-            unrealized_pnl = (ltp - average_price) * quantity
+            pnl = (ltp - average_price) * quantity
         else:
-            unrealized_pnl = 0.0
-        pnl = realized_pnl + unrealized_pnl
+            pnl = realized_pnl
 
         transformed.append(
             {

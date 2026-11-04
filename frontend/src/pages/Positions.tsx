@@ -183,6 +183,9 @@ export default function Positions() {
     staleThreshold: 5000,
     multiQuotesRefreshInterval: 30000,
     pauseWhenHidden: true,
+    // The page shows each row's total P&L, so keep the realised part the
+    // backend computed instead of rebuilding it from average_price (#2266).
+    preserveBackendPnl: true,
   })
 
   // Load preferences from localStorage
