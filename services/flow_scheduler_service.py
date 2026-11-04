@@ -6,11 +6,14 @@ Handles scheduled workflow execution using APScheduler (Flask/sync version)
 
 import threading
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 
+from apscheduler.events import EVENT_JOB_MISSED
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.base import STATE_STOPPED
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -35,6 +38,181 @@ logger = get_logger(__name__)
 #: closed. Tunable because how long a feed takes to settle is a property of the
 #: broker and the instrument, not of this scheduler.
 INTERVAL_ALIGN_OFFSET_SECONDS = env_int("FLOW_INTERVAL_ALIGN_OFFSET", 2, minimum=0)
+
+
+#: Seconds between the watchdog's checks on the scheduler thread (#2326).
+WATCHDOG_INTERVAL_SECONDS = env_int("FLOW_SCHEDULER_WATCHDOG_INTERVAL", 30, minimum=5)
+
+#: How far past its due time a job may sit before the watchdog nudges the
+#: scheduler awake. Well inside the 60s misfire grace, so a nudged job still runs.
+OVERDUE_WAKE_SECONDS = 30
+
+#: How long a job may stay overdue, despite the nudges, before the watchdog
+#: reports the scheduler as stuck.
+STUCK_AFTER_SECONDS = 300
+
+MISFIRE_GRACE_SECONDS = 60
+
+#: Set while the scheduler's own loop is processing jobs, so the job store can
+#: tell its bookkeeping writes apart from writes made on behalf of an API call.
+_in_scheduler_loop = threading.local()
+
+
+def _sort_by_next_run(jobs: list) -> list:
+    """Due jobs first, paused jobs (no next run time) last, as APScheduler sorts."""
+    return sorted(
+        jobs,
+        key=lambda job: (job.next_run_time is None, job.next_run_time or datetime.min),
+    )
+
+
+class _ResilientJobStore(SQLAlchemyJobStore):
+    """A job store whose failed bookkeeping write cannot stop the scheduler.
+
+    After each run APScheduler saves the job's next run time with
+    ``update_job``. APScheduler 3.x calls that outside any error handling, so a
+    single failure there (a write lock outlasting the database layer's retry
+    budget, or a dropped connection) escaped the loop and killed the scheduler
+    thread for good. Nothing was logged, the scheduler still reported itself
+    running, and every job stayed in the store with its next run time in the
+    past until the process restarted (issue #2326).
+
+    A failed write from the loop is kept here and retried before the next
+    lookup, and in the meantime every read sees the unsaved next run time.
+    Without that, the job would look due again at the run time that was just
+    executed and fire a second time within the misfire grace, which for a flow
+    with order nodes is a duplicate order. Writes made for an API call (pause,
+    resume, replace) still raise, so the caller learns it did not take.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._unsaved = {}
+        self._unsaved_lock = threading.Lock()
+
+    def _forget(self, job_id: str) -> None:
+        with self._unsaved_lock:
+            self._unsaved.pop(job_id, None)
+
+    def _overlay(self, jobs: list) -> list:
+        """Replace each job with its unsaved version, where there is one."""
+        with self._unsaved_lock:
+            unsaved = dict(self._unsaved)
+        if not unsaved:
+            return jobs
+        return _sort_by_next_run([unsaved.get(job.id, job) for job in jobs])
+
+    def _save_unsaved(self) -> None:
+        """Try again to write the next run times that failed to save."""
+        with self._unsaved_lock:
+            pending = list(self._unsaved.values())
+        for job in pending:
+            try:
+                super().update_job(job)
+            except JobLookupError:
+                # Removed meanwhile; nothing left to save.
+                pass
+            except Exception:
+                # Still failing. Leave the rest for the next pass.
+                return
+            with self._unsaved_lock:
+                if self._unsaved.get(job.id) is job:
+                    del self._unsaved[job.id]
+            logger.info(f"Saved the delayed next run time for scheduler job {job.id}")
+
+    def update_job(self, job):
+        try:
+            super().update_job(job)
+        except JobLookupError:
+            self._forget(job.id)
+            raise
+        except Exception:
+            if not getattr(_in_scheduler_loop, "active", False):
+                raise
+            with self._unsaved_lock:
+                self._unsaved[job.id] = job
+            logger.exception(
+                f"Could not save the next run time ({job.next_run_time}) for scheduler "
+                f"job {job.id}; keeping it in memory and retrying"
+            )
+        else:
+            self._forget(job.id)
+
+    def get_due_jobs(self, now):
+        self._save_unsaved()
+        return [
+            job
+            for job in self._overlay(super().get_due_jobs(now))
+            if job.next_run_time is not None and job.next_run_time <= now
+        ]
+
+    def get_next_run_time(self):
+        with self._unsaved_lock:
+            has_unsaved = bool(self._unsaved)
+        if not has_unsaved:
+            return super().get_next_run_time()
+        times = [job.next_run_time for job in self.get_all_jobs() if job.next_run_time]
+        return min(times) if times else None
+
+    def lookup_job(self, job_id):
+        job = super().lookup_job(job_id)
+        if job is None:
+            return None
+        return self._overlay([job])[0]
+
+    def get_all_jobs(self):
+        return self._overlay(super().get_all_jobs())
+
+    def add_job(self, job):
+        super().add_job(job)
+        self._forget(job.id)
+
+    def remove_job(self, job_id):
+        super().remove_job(job_id)
+        self._forget(job_id)
+
+    def remove_all_jobs(self):
+        super().remove_all_jobs()
+        with self._unsaved_lock:
+            self._unsaved.clear()
+
+
+class _ResilientBackgroundScheduler(BackgroundScheduler):
+    """A BackgroundScheduler whose loop survives an error in one pass.
+
+    APScheduler 3.x runs ``_process_jobs`` in a bare ``while`` loop, so any
+    exception it raises ends the scheduler thread silently (issue #2326). Here a
+    failed pass is logged and retried after ``jobstore_retry_interval`` seconds,
+    the same back-off APScheduler already uses when ``get_due_jobs`` fails.
+    """
+
+    def _process_jobs(self):
+        _in_scheduler_loop.active = True
+        try:
+            return super()._process_jobs()
+        except Exception:
+            logger.exception(
+                f"Flow scheduler pass failed; retrying in {self.jobstore_retry_interval:g}s"
+            )
+            return self.jobstore_retry_interval
+        finally:
+            _in_scheduler_loop.active = False
+
+
+def _log_missed_run(event) -> None:
+    """Report a scheduled run that was skipped for starting too late.
+
+    APScheduler drops a run that misses the grace window and logs only a
+    generic line from its own logger, so a lost run never showed up as a flow
+    event.
+    """
+    if not str(event.job_id).startswith("flow_workflow_"):
+        return
+    logger.warning(
+        f"Skipped the scheduled run of {event.job_id} due at "
+        f"{event.scheduled_run_time:%Y-%m-%d %H:%M:%S %Z}: it could not start within "
+        f"{MISFIRE_GRACE_SECONDS}s of its due time"
+    )
 
 
 def _next_aligned_start(value: int, unit: str) -> datetime:
@@ -67,6 +245,8 @@ class FlowScheduler:
 
     _instance: Optional["FlowScheduler"] = None
     _scheduler: BackgroundScheduler | None = None
+    _jobstore: _ResilientJobStore | None = None
+    _db_url: str | None = None
     _lock = threading.Lock()
     _initialized = False
     _api_key: str | None = None
@@ -91,6 +271,7 @@ class FlowScheduler:
                 db_url = get_database_url()
 
             self._api_key = api_key
+            self._db_url = db_url
 
             try:
                 # Create the job store table before APScheduler would. Its own
@@ -103,25 +284,126 @@ class FlowScheduler:
                 # starts the scheduler outside that path.
                 ensure_jobstore_table(FLOW_JOBSTORE_TABLE, database_url=db_url)
 
-                # engine= rather than url= so the job store uses the project
-                # NullPool policy instead of SQLAlchemy's default QueuePool,
-                # which would hold connections open for the life of the
-                # process. See database/engine_factory.py.
-                jobstores = {
-                    "default": SQLAlchemyJobStore(
-                        engine=create_db_engine(db_url), tablename=FLOW_JOBSTORE_TABLE
-                    )
-                }
-                self._scheduler = BackgroundScheduler(
-                    jobstores=jobstores,
-                    job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 60},
-                )
+                self._scheduler, self._jobstore = self._build_scheduler(db_url)
                 self._scheduler.start()
                 self._initialized = True
+                self._start_watchdog()
                 logger.debug("Flow Scheduler initialized and started")
             except Exception as e:
                 logger.exception(f"Failed to initialize Flow Scheduler: {e}")
                 raise
+
+    @staticmethod
+    def _build_scheduler(db_url: str, unsaved: dict | None = None):
+        """A new scheduler and its job store, not yet started.
+
+        ``unsaved`` carries next run times the previous job store could not
+        write, so a restarted scheduler does not run those jobs a second time.
+        """
+        # engine= rather than url= so the job store uses the project NullPool
+        # policy instead of SQLAlchemy's default QueuePool, which would hold
+        # connections open for the life of the process. See
+        # database/engine_factory.py.
+        jobstore = _ResilientJobStore(
+            engine=create_db_engine(db_url), tablename=FLOW_JOBSTORE_TABLE
+        )
+        if unsaved:
+            jobstore._unsaved.update(unsaved)
+        scheduler = _ResilientBackgroundScheduler(
+            jobstores={"default": jobstore},
+            job_defaults={
+                "coalesce": True,
+                "max_instances": 1,
+                "misfire_grace_time": MISFIRE_GRACE_SECONDS,
+            },
+        )
+        scheduler.add_listener(_log_missed_run, EVENT_JOB_MISSED)
+        return scheduler, jobstore
+
+    def _start_watchdog(self) -> None:
+        """Start the thread that keeps the scheduler thread alive and awake."""
+        self._watchdog_stop = threading.Event()
+        self._overdue_since = None
+        self._stuck_reported = False
+        threading.Thread(
+            target=self._watchdog_loop,
+            args=(self._watchdog_stop,),
+            name="FlowSchedulerWatchdog",
+            daemon=True,
+        ).start()
+
+    def _watchdog_loop(self, stop: threading.Event) -> None:
+        while not stop.wait(WATCHDOG_INTERVAL_SECONDS):
+            try:
+                self._check_scheduler()
+            except Exception:
+                logger.exception("Flow scheduler watchdog check failed")
+
+    def _check_scheduler(self) -> None:
+        """Restart a dead scheduler thread and wake one that is behind (#2326).
+
+        Two ways a job can sit past its due time with nothing firing it:
+
+        * The scheduler thread has died. The scheduler still reports itself
+          running, so nothing else would ever notice. It is rebuilt here.
+        * The thread is alive but asleep past the due time, as happens on
+          Windows after the machine sleeps: the wait does not count the time
+          spent asleep, so a 10-minute wait could end ten minutes late and
+          skip the run. A wake-up makes it look at the clock again.
+
+        A job still behind after repeated wake-ups means the thread is stuck
+        in a call that never returns. That cannot be undone from here without
+        risking two threads running the same jobs, so it is reported instead.
+        """
+        scheduler = self._scheduler
+        if scheduler is None or scheduler.state == STATE_STOPPED:
+            return
+
+        thread = getattr(scheduler, "_thread", None)
+        if thread is not None and not thread.is_alive():
+            logger.error("The Flow scheduler thread stopped unexpectedly; restarting it")
+            self._restart_scheduler()
+            return
+
+        # Read the job store directly rather than through the scheduler, whose
+        # lock a stuck thread would be holding.
+        next_run = self._jobstore.get_next_run_time()
+        now = datetime.now(UTC)
+        if next_run is None or (now - next_run).total_seconds() <= OVERDUE_WAKE_SECONDS:
+            if self._stuck_reported:
+                logger.info("Flow scheduler is running scheduled jobs again")
+            self._overdue_since = None
+            self._stuck_reported = False
+            return
+
+        if self._overdue_since is None:
+            self._overdue_since = now
+        scheduler.wakeup()
+
+        stuck_for = (now - self._overdue_since).total_seconds()
+        if stuck_for >= STUCK_AFTER_SECONDS and not self._stuck_reported:
+            self._stuck_reported = True
+            logger.error(
+                f"Flow scheduler has not run a job due at {next_run:%Y-%m-%d %H:%M:%S %Z} "
+                f"for {stuck_for / 60:.0f} minutes. Scheduled flows will not run until "
+                "OpenAlgo is restarted."
+            )
+
+    def _restart_scheduler(self) -> None:
+        """Replace a scheduler whose thread has died with a new one."""
+        with self._lock:
+            old_scheduler, old_store = self._scheduler, self._jobstore
+            with old_store._unsaved_lock:
+                unsaved = dict(old_store._unsaved)
+            try:
+                old_scheduler.shutdown(wait=False)
+            except Exception:
+                logger.exception("Could not shut down the stopped Flow scheduler cleanly")
+            self._scheduler, self._jobstore = self._build_scheduler(self._db_url, unsaved)
+            self._scheduler.start()
+            self._overdue_since = None
+            self._stuck_reported = False
+            logger.info("Flow scheduler restarted")
 
     def set_api_key(self, api_key: str):
         """Set API key for workflow execution"""
@@ -344,6 +626,9 @@ class FlowScheduler:
 
     def shutdown(self):
         """Shutdown the scheduler"""
+        stop = getattr(self, "_watchdog_stop", None)
+        if stop is not None:
+            stop.set()
         if self._scheduler:
             self._scheduler.shutdown(wait=False)
             self._initialized = False
