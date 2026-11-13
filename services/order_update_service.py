@@ -75,6 +75,34 @@ _BROKER_FACTORIES: dict[str, tuple[str, str]] = {
         "broker.tradesmart.streaming.tradesmart_order_adapter",
         "create_tradesmart_order_adapter",
     ),
+    "compositedge": (
+        "broker.compositedge.streaming.compositedge_order_adapter",
+        "create_compositedge_order_adapter",
+    ),
+    "fivepaisaxts": (
+        "broker.fivepaisaxts.streaming.fivepaisaxts_order_adapter",
+        "create_fivepaisaxts_order_adapter",
+    ),
+    "ibulls": (
+        "broker.ibulls.streaming.ibulls_order_adapter",
+        "create_ibulls_order_adapter",
+    ),
+    "iifl": (
+        "broker.iifl.streaming.iifl_order_adapter",
+        "create_iifl_order_adapter",
+    ),
+    "jainamxts": (
+        "broker.jainamxts.streaming.jainamxts_order_adapter",
+        "create_jainamxts_order_adapter",
+    ),
+    "wisdom": (
+        "broker.wisdom.streaming.wisdom_order_adapter",
+        "create_wisdom_order_adapter",
+    ),
+    "rmoney": (
+        "broker.rmoney.streaming.rmoney_order_adapter",
+        "create_rmoney_order_adapter",
+    ),
 }
 
 # Brokers with no *usable* push mechanism fall back to REST-orderbook polling.
