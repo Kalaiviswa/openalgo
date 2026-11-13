@@ -79,6 +79,10 @@ _BROKER_FACTORIES: dict[str, tuple[str, str]] = {
         "broker.firstock.streaming.firstock_order_adapter",
         "create_firstock_order_adapter",
     ),
+    "rupeezy": (
+        "broker.rupeezy.streaming.rupeezy_order_adapter",
+        "create_rupeezy_order_adapter",
+    ),
 }
 
 # Brokers with no *usable* push mechanism fall back to REST-orderbook polling.

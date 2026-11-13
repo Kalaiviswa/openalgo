@@ -22,6 +22,9 @@ logger = get_logger(__name__)
 _STATUS_MAP = {
     "EXECUTED": "complete",
     "COMPLETE": "complete",
+    # The postback sample (vortex-api-docs/19-postbacks.md) reports a filled
+    # order as COMPLETED.
+    "COMPLETED": "complete",
     "PENDING": "open",
     "OPEN": "open",
     "OMSXMITTED": "open",
