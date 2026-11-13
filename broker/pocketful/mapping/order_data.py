@@ -205,6 +205,9 @@ def transform_order_data(orders):
             or "PENDING" in status
             or "AMO_SUBMIT" in status
             or "MODIFY" in status
+            # A confirmed modification leaves the order working (the order
+            # update sample at api.pocketful.in/docs/curl/order-updates).
+            or "MODCONFIRMED" in status
             or mode == "NEW"
         ):
             order_status = "open"
