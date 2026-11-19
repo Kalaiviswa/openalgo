@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -112,9 +113,43 @@ def sec_orders(run: Runner) -> None:
         run.track_order(r["orderid"], s, e, product)
         return r["orderid"]
 
-    def far(action):
+    ticks: dict = {}
+
+    def tick_of(s, e):
+        """The instrument's tick from the master contract. A price that is not a
+        multiple of it is rejected by the broker (BAJAJ-AUTO 8653.60 against a
+        1.00 tick), which says nothing about the order path under test."""
+        if (s, e) not in ticks:
+            with run.db() as c:
+                row = c.execute("select tick_size from symtoken where symbol=? and exchange=?",
+                                (s, e)).fetchone()
+            ticks[(s, e)] = float(row[0]) if row and row[0] else 0.0
+        return ticks[(s, e)]
+
+    def on_tick(price, s=None, e=None, up=False):
+        """Snap a price to the instrument's tick: down for a buy below the
+        market, up for anything placed above it."""
+        t = tick_of(s or sym, e or ex)
+        if t <= 0:
+            return round(price, 2)
+        n = price / t
+        n = math.ceil(n - 1e-9) if up else math.floor(n + 1e-9)
+        return round(n * t, 6)
+
+    def far(action, s=None, e=None, ref=None):
         """20% away - a resting order that cannot fill (safety rail 1.4)."""
-        return round(ltp * (0.80 if action == "BUY" else 1.20), 2)
+        base = ltp if ref is None else ref
+        if action == "BUY":
+            return on_tick(base * 0.80, s, e)
+        return on_tick(base * 1.20, s, e, up=True)
+
+    def stop_above():
+        """A buy stop rests only with its trigger ABOVE the market (it fires
+        when the price rises to it) and its limit at or above the trigger;
+        trigger above limit is refused outright. 5% up keeps it inside the
+        price band of an F&O stock while being far enough not to fire."""
+        trig = on_tick(ltp * 1.05, up=True)
+        return trig, on_tick(trig * 1.01, up=True)
 
     # OD-03 / OD-04 / OD-05 - resting orders, no fill risk
     def limit_rests():
@@ -129,8 +164,8 @@ def sec_orders(run: Runner) -> None:
               expected="far LIMIT rests as open")
 
     def sl_rests():
-        p = far("BUY")
-        oid = place("SL", "BUY", "MIS", p, round(p * 1.01, 2))
+        trig, p = stop_above()
+        oid = place("SL", "BUY", "MIS", p, trig)
         time.sleep(2.0)
         st = run.ok(run.client.orderstatus(order_id=oid, strategy=STRAT), "status")["data"]
         need(st["order_status"] in ("trigger pending", "open"),
@@ -140,7 +175,7 @@ def sec_orders(run: Runner) -> None:
               expected="SL rests as trigger pending")
 
     def slm_rests():
-        oid = place("SL-M", "BUY", "MIS", 0, round(ltp * 1.25, 2))
+        oid = place("SL-M", "BUY", "MIS", 0, stop_above()[0])
         time.sleep(2.0)
         st = run.ok(run.client.orderstatus(order_id=oid, strategy=STRAT), "status")["data"]
         need(st["order_status"] in ("trigger pending", "open"),
@@ -170,16 +205,34 @@ def sec_orders(run: Runner) -> None:
                   endpoint="placeorder", exchange=ex, symbol=sym,
                   expected=f"{product} accepted on {ex}")
 
-    run.check("OD-10", lambda: run.expect_error(
-        run.client.placeorder(strategy=STRAT, symbol=sym, exchange=ex, action="BUY",
-                              price_type="LIMIT", product="NRML", quantity=1,
-                              price=far("BUY")), "NRML on equity"),
-        endpoint="placeorder", expected="product/exchange mismatch refused")
+    def nrml_on_equity():
+        """OD-10 - NRML on a cash exchange must not end up as a working order.
+        Refused up front is best; brokers on the Noren backend accept it and
+        their RMS rejects it a moment later ("NRML PRODUCT NOT ALLOWED FOR NSE
+        AND BSE CASH"), which is just as safe and is accepted here."""
+        r = run.client.placeorder(strategy=STRAT, symbol=sym, exchange=ex, action="BUY",
+                                  price_type="LIMIT", product="NRML", quantity=1,
+                                  price=far("BUY"))
+        if isinstance(r, dict) and r.get("status") == "error":
+            run.expect_error(r, "NRML on equity")
+            return
+        oid = r.get("orderid") if isinstance(r, dict) else None
+        need(oid, f"NRML on equity: neither an error nor an orderid: {r!r}")
+        run.track_order(oid, sym, ex, "NRML")
+        time.sleep(2.0)
+        st = run.ok(run.client.orderstatus(order_id=oid, strategy=STRAT), "status")["data"]
+        need(st["order_status"] == "rejected",
+             f"NRML on {ex} was accepted and is {st['order_status']!r} - it should be "
+             "refused up front or rejected by the broker")
+        run.note_limit("NRML on cash", "accepted, then rejected by the broker")
+
+    run.check("OD-10", nrml_on_equity, endpoint="placeorder+orderstatus",
+              expected="product/exchange mismatch refused or rejected")
 
     if "EQ_SPECIAL" in m:
         s2, e2 = m["EQ_SPECIAL"]
         l2 = as_num(run.ok(run.client.quotes(symbol=s2, exchange=e2), "q")["data"]["ltp"], "ltp")
-        run.check("OD-12", lambda: place("LIMIT", "BUY", "MIS", round(l2 * 0.80, 2),
+        run.check("OD-12", lambda: place("LIMIT", "BUY", "MIS", far("BUY", s2, e2, l2),
                                          symbol=s2, exchange=e2),
                   endpoint="placeorder", symbol=s2, expected="special character intact")
 
@@ -196,7 +249,8 @@ def sec_orders(run: Runner) -> None:
             lot = _lot(run, s3, e3)
             q3 = as_num(run.ok(run.client.quotes(symbol=s3, exchange=e3), "q")["data"]["ltp"], "ltp")
             run.check(f"OD-11.{exch}", lambda s3=s3, e3=e3, lot=lot, q3=q3: place(
-                "LIMIT", "BUY", "NRML", round(q3 * 0.50, 1), symbol=s3, exchange=e3, qty=lot),
+                "LIMIT", "BUY", "NRML", on_tick(q3 * 0.50, s3, e3), symbol=s3, exchange=e3,
+                qty=lot),
                 endpoint="placeorder", exchange=exch, symbol=s3,
                 expected="claimed exchange accepts a real order")
 
@@ -207,7 +261,7 @@ def sec_orders(run: Runner) -> None:
         p = far("BUY")
         oid = place("LIMIT", "BUY", "MIS", p)
         time.sleep(2.0)
-        newp = round(p * 0.99, 2)
+        newp = on_tick(p * 0.99)
         run.ok(run.client.modifyorder(order_id=oid, strategy=STRAT, symbol=sym, exchange=ex,
                                       action="BUY", price_type="LIMIT", product="MIS",
                                       quantity=1, price=newp), "modify")
