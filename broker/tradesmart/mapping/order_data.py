@@ -1,7 +1,22 @@
+from datetime import datetime
+
 from database.token_db import get_oa_symbol, get_symbol
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _orderbook_timestamp(norentm):
+    """TradeSmart's "HH:MM:SS DD-MM-YYYY" as the orderbook's "DD-Mon-YYYY HH:MM:SS".
+
+    docs/api/account-services/orderbook.md documents "08-Apr-2025 13:58:03".
+    Anything that does not parse is returned unchanged rather than dropped.
+    """
+    raw = str(norentm or "").strip()
+    try:
+        return datetime.strptime(raw, "%H:%M:%S %d-%m-%Y").strftime("%d-%b-%Y %H:%M:%S")
+    except ValueError:
+        return raw
 
 
 # TradeSmart (Noren) order statuses arrive with underscores ("TRIGGER_PENDING")
@@ -74,7 +89,7 @@ def map_order_data(order_data):
                 order["prd"] = "CNC"
             elif order["prd"] == "I":
                 order["prd"] = "MIS"
-            elif order["exch"] in ["NFO", "MCX", "BFO", "CDS"] and order["prd"] == "M":
+            elif order["prd"] == "M":  # NRML on every exchange, incl. a rejected NSE/BSE cash order
                 order["prd"] = "NRML"
 
             price_type = str(order.get("prctyp") or "").upper()
@@ -155,7 +170,7 @@ def transform_order_data(orders):
             "product": order.get("prd", ""),
             "orderid": order.get("norenordno", ""),
             "order_status": normalize_order_status(order.get("status")),
-            "timestamp": order.get("norentm", ""),
+            "timestamp": _orderbook_timestamp(order.get("norentm", "")),
         })
 
     return transformed_orders
@@ -179,7 +194,7 @@ def map_trade_data(trade_data):
                     order["prd"] = "CNC"
                 elif order["prd"] == "I":
                     order["prd"] = "MIS"
-                elif order["exch"] in ["NFO", "MCX", "BFO", "CDS"] and order["prd"] == "M":
+                elif order["prd"] == "M":  # NRML on every exchange, incl. a rejected NSE/BSE cash order
                     order["prd"] = "NRML"
 
                 if order["trantype"] == "B":
@@ -234,7 +249,7 @@ def map_position_data(position_data):
                     order["prd"] = "CNC"
                 elif order["prd"] == "I":
                     order["prd"] = "MIS"
-                elif order["exch"] in ["NFO", "MCX", "BFO", "CDS"] and order["prd"] == "M":
+                elif order["prd"] == "M":  # NRML on every exchange, incl. a rejected NSE/BSE cash order
                     order["prd"] = "NRML"
             else:
                 logger.warning(f"Unable to find symbol {symbol} on {exchange}.")
