@@ -1272,7 +1272,7 @@ def test_the_migration_adds_its_tables_once(tmp_path):
 
     status = _migrate(db_file, "--status")
     assert status.returncode == 0, status.stdout + status.stderr
-    assert "Would create 4 table(s) and add 0 column(s)." in status.stdout
+    assert "Would create 3 table(s) and add 0 column(s)." in status.stdout
 
     first = _migrate(db_file)
     again = _migrate(db_file)
@@ -1285,9 +1285,11 @@ def test_the_migration_adds_its_tables_once(tmp_path):
         "broker_keys",
         "session_revocations",
         "broker_login_states",
-        "broker_rate_plans",
         "ix_broker_keys_broker",
     } <= names
+    with closing(sqlite3.connect(db_file)) as conn:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(broker_keys)")}
+    assert "rate_plan" in columns
 
 
 def test_the_migration_adds_only_what_is_missing(tmp_path):
@@ -1314,17 +1316,20 @@ def test_the_migration_adds_only_what_is_missing(tmp_path):
     status = _migrate(db_file, "--status")
     applied = _migrate(db_file)
 
-    assert "Would create 3 table(s) and add 0 column(s)." in status.stdout
+    assert "Would create 2 table(s) and add 1 column(s)." in status.stdout
     assert "broker_keys            present" in status.stdout
+    assert "broker_keys.rate_plan" in status.stdout
     assert "[OK] Created session_revocations" in applied.stdout
-    # The API plan table (Fyers Standard or Prime) reaches an install that
-    # already had the broker keys tables.
-    assert "[OK] Created broker_rate_plans" in applied.stdout
+    # The API plan column (Fyers Standard or Prime) reaches an install that
+    # already had the broker keys table, empty: every broker on its default.
+    assert "[OK] Added broker_keys.rate_plan" in applied.stdout
     assert "Created broker_keys" not in applied.stdout
     with closing(sqlite3.connect(db_file)) as conn:
-        assert conn.execute("SELECT broker, api_key FROM broker_keys").fetchall() == [
-            ("fyers", "c1")
+        assert conn.execute("SELECT broker, api_key, rate_plan FROM broker_keys").fetchall() == [
+            ("fyers", "c1", None)
         ]
+    again = _migrate(db_file)
+    assert again.returncode == 0 and "[SKIP] All columns already exist" in again.stdout
 
 
 def test_the_migration_creates_no_database(tmp_path):
@@ -3884,3 +3889,63 @@ def test_a_plan_the_broker_does_not_offer_is_refused(stores, environment):
     assert _app().test_client().put(
         "/api/broker/rate-plan/fyers", json={"plan": "prime"}, headers=JSON
     ).status_code == 401
+
+
+def test_a_plan_for_an_env_broker_is_kept_in_a_row_without_keys(stores, environment):
+    """Fyers keys in .env have no saved row: choosing Prime adds one that holds
+    the plan alone, and it does not read as saved keys anywhere."""
+    environment.write(
+        {
+            "BROKER_API_KEY": "ENVAPP-100",
+            "BROKER_API_SECRET": "env-secret",
+            "REDIRECT_URL": "http://127.0.0.1:5000/fyers/callback",
+        }
+    )
+    client = _signed_in(_app())
+
+    assert client.put("/api/broker/rate-plan/zerodha", json={"plan": "prime"}).status_code == 400
+    assert client.put("/api/broker/rate-plan/fyers", json={"plan": "prime"}).status_code == 200
+
+    assert keys_db.get_rate_plan("fyers") == "prime"
+    assert keys_db.get_broker_keys("fyers").api_key == ""
+    _, brokers = _listed(client)
+    assert brokers["fyers"]["source"] == "env" and brokers["fyers"]["rate_plan"] == "prime"
+
+
+def test_a_plan_only_row_is_not_saved_keys(stores, environment):
+    client = _signed_in(_app())
+    assert keys_db.save_rate_plan("fyers", "prime")
+
+    _, brokers = _listed(client)
+    assert not brokers["fyers"]["configured"] and brokers["fyers"]["source"] is None
+    assert brokers["fyers"]["rate_plan"] == "prime"
+    assert _forget(client, "fyers").status_code == 404
+    # Keys saved onto that row still need the API key, as for a new broker.
+    assert not keys_db.save_broker_keys("fyers", {"api_secret": "only-secret"})[0]
+    _save_fyers()
+    assert keys_db.get_broker_keys("fyers").api_key == SAVED_FYERS["api_key"]
+    assert keys_db.get_rate_plan("fyers") == "prime"
+
+
+def test_forgetting_a_broker_keeps_its_plan(stores, environment):
+    client = _signed_in(_app())
+    _save_fyers()
+    assert keys_db.save_rate_plan("fyers", "prime")
+
+    assert _forget(client, "fyers").status_code == 200
+
+    assert keys_db.get_rate_plan("fyers") == "prime"
+    stored = keys_db.get_broker_keys("fyers")
+    assert stored.api_key == "" and stored.api_secret == "" and stored.redirect_url == ""
+    _, brokers = _listed(client)
+    assert not brokers["fyers"]["configured"]
+    assert _forget(client, "fyers").status_code == 404
+
+
+def test_forgetting_a_broker_with_no_plan_removes_its_row(stores, environment):
+    client = _signed_in(_app())
+    _save_fyers()
+
+    assert _forget(client, "fyers").status_code == 200
+
+    assert keys_db.get_broker_keys("fyers") is None and keys_db.get_rate_plan("fyers") is None

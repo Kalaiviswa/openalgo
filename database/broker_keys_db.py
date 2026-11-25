@@ -19,9 +19,11 @@ re-encrypt the whole plaintext, so the binding survives them. Nothing here
 returns a secret to a caller that only needs to show it: the masked view lives
 in the blueprint.
 
-The started broker logins (broker_login_states) sit here too, and the API
-plan the trader chose for a broker that has more than one (broker_rate_plans,
-Fyers Standard or Prime), which decides how fast its requests are paced.
+The started broker logins (broker_login_states) sit here too. A broker's
+row also holds the API plan the trader chose for a broker that has more than
+one (rate_plan, Fyers Standard or Prime), which decides how fast its requests
+are paced; choosing a plan for a broker with no saved keys (one whose keys are
+in .env) adds a row that holds the plan and no keys.
 """
 
 import hashlib
@@ -62,6 +64,10 @@ class BrokerKey(Base):
     api_key_market = Column(Text, nullable=False, default="")
     api_secret_market = Column(Text, nullable=False, default="")
     redirect_url = Column(String(500), nullable=False, default="")
+    # The API plan the broker's requests are paced for, in plain text (not a
+    # secret). Empty means its default plan, the first one
+    # utils/broker_setup_guide.py lists.
+    rate_plan = Column(String(30), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -86,21 +92,6 @@ class BrokerLoginState(Base):
     expires_at = Column(DateTime, nullable=False)
 
 
-class BrokerRatePlan(Base):
-    """The API plan the trader chose for one broker (Fyers: standard or prime).
-
-    Not a secret, so stored in plain text. A broker without a row is paced for
-    its default plan, the first one utils/broker_setup_guide.py lists.
-    """
-
-    __tablename__ = "broker_rate_plans"
-
-    id = Column(Integer, primary_key=True)
-    broker = Column(String(50), unique=True, nullable=False, index=True)
-    plan = Column(String(30), nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
 #: How long a started login stays open, and how many may be open at once.
 LOGIN_STATE_TTL = timedelta(minutes=10)
 MAX_LOGIN_STATES = 16
@@ -123,11 +114,41 @@ class StoredBrokerKeys:
     updated_at: datetime | None
 
 
+def ensure_broker_keys_columns(target_engine=None):
+    """Add the columns broker_keys gained after it was first created.
+
+    Run at startup and by upgrade/migrate_broker_keys.py, for an install that
+    created the table before rate_plan existed. The column starts empty, which
+    means every broker's default plan, so there is nothing to backfill.
+    Idempotent.
+
+    Returns:
+        list[str]: The columns added.
+    """
+    from sqlalchemy import inspect, text
+
+    target_engine = target_engine or engine
+    inspector = inspect(target_engine)
+    if "broker_keys" not in inspector.get_table_names():
+        return []
+    present = {column["name"] for column in inspector.get_columns("broker_keys")}
+    added = []
+    if "rate_plan" not in present:
+        with target_engine.begin() as conn:
+            conn.execute(text("ALTER TABLE broker_keys ADD COLUMN rate_plan VARCHAR(30)"))
+        added.append("rate_plan")
+    return added
+
+
 def init_db():
     """Create the broker keys and broker login tables."""
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Broker Keys DB", logger)
+    try:
+        ensure_broker_keys_columns()
+    except Exception:
+        logger.exception("Could not add the API plan column to the broker keys table")
 
 
 def ensure_broker_keys_tables_exists():
@@ -250,9 +271,11 @@ def save_broker_keys(broker, values, redirect_url=None):
     """
     try:
         row = BrokerKey.query.filter_by(broker=broker).first()
+        # A row may hold only an API plan (chosen for a broker whose keys are
+        # in .env): it has no keys yet, so it needs its API key like a new one.
+        if (row is None or not row.api_key) and not values.get("api_key"):
+            return False, "Enter the API key to save this broker."
         if row is None:
-            if not values.get("api_key"):
-                return False, "Enter the API key to save this broker."
             row = BrokerKey(broker=broker)
             db_session.add(row)
         for field in KEY_FIELDS:
@@ -275,13 +298,25 @@ def save_broker_keys(broker, values, redirect_url=None):
 def delete_broker_keys(broker):
     """Remove a broker's saved keys (Forget this broker).
 
+    The API plan chosen for it stays: the row is kept with its keys emptied,
+    as a plan chosen for an .env broker is kept without keys.
+
     Returns:
-        bool: True when a row was removed.
+        bool: True when keys were removed.
     """
     try:
-        deleted = BrokerKey.query.filter_by(broker=broker).delete()
+        row = BrokerKey.query.filter_by(broker=broker).first()
+        if row is None or not row.api_key:
+            return False
+        if row.rate_plan:
+            for field in KEY_FIELDS:
+                setattr(row, field, "")
+            row.redirect_url = ""
+            row.updated_at = datetime.utcnow()
+        else:
+            db_session.delete(row)
         db_session.commit()
-        return bool(deleted)
+        return True
     except Exception:
         db_session.rollback()
         logger.exception(f"Could not remove the keys for {broker}")
@@ -423,13 +458,14 @@ def get_rate_plan(broker):
         broker: The broker id, such as "fyers".
 
     Returns:
-        str | None: The plan id; None also when the table does not exist yet.
+        str | None: The plan id; None also when the table or its rate_plan
+        column does not exist yet.
     """
     try:
-        row = BrokerRatePlan.query.filter_by(broker=broker).first()
-        return row.plan if row else None
+        row = BrokerKey.query.filter_by(broker=broker).first()
+        return (row.rate_plan or None) if row else None
     except Exception as exc:
-        if not _table_missing(exc):
+        if not _table_missing(exc) and "no such column" not in str(exc).lower():
             logger.exception(f"Could not read the API plan saved for {broker}")
         return None
     finally:
@@ -439,17 +475,18 @@ def get_rate_plan(broker):
 def save_rate_plan(broker, plan):
     """Save the API plan a broker's requests are paced for.
 
-    The caller checks that the broker offers the plan.
+    A broker with no saved keys (its keys are in .env) gets a row holding the
+    plan alone. The caller checks that the broker offers the plan.
 
     Returns:
         bool: True when it was saved.
     """
     try:
-        row = BrokerRatePlan.query.filter_by(broker=broker).first()
+        row = BrokerKey.query.filter_by(broker=broker).first()
         if row is None:
-            row = BrokerRatePlan(broker=broker, plan=plan)
+            row = BrokerKey(broker=broker)
             db_session.add(row)
-        row.plan = plan
+        row.rate_plan = plan
         row.updated_at = datetime.utcnow()
         db_session.commit()
         return True

@@ -336,7 +336,9 @@ def forget_broker(broker):
         return _error(
             f"Your {name} keys are in the .env file. Remove the broker lines there to forget them."
         )
-    if get_broker_keys(broker) is None:
+    stored = get_broker_keys(broker)
+    # A row may hold only the API plan chosen for the broker, and no keys.
+    if stored is None or not stored.api_key:
         return _error(f"No keys are saved for {name}.", 404)
     if login_slot_broker() == broker:
         return _error(

@@ -2,7 +2,7 @@
 """
 Migration: Broker Keys and session sign-out
 
-Adds three tables to the main database:
+Adds three tables to the main database, and a column to one of them:
 
 - broker_keys: the API keys a trader saves in OpenAlgo (Broker Configuration),
   one set per broker, every key and secret encrypted. The trader logs in to
@@ -17,13 +17,13 @@ Adds three tables to the main database:
 - broker_login_states: broker logins started from the broker login page and
   not yet completed, kept as SHA-256 digests with a ten-minute expiry, so the
   broker's answer is accepted only for a login started here.
-- broker_rate_plans: the API plan the trader chose for a broker that offers
-  more than one (Fyers Standard or Prime), which sets how fast OpenAlgo paces
-  that broker's requests. A broker with no row is paced for its stricter
-  default plan, so an install that upgrades starts with nothing to backfill.
+- broker_keys.rate_plan: the API plan the trader chose for a broker that
+  offers more than one (Fyers Standard or Prime), which sets how fast OpenAlgo
+  paces that broker's requests. Empty means the broker's stricter default
+  plan, so an install that upgrades starts with nothing to backfill.
 
 All are new tables, so there is nothing to backfill and no existing value to
-preserve; the added column starts empty for the same reason. The app creates them at startup too; this script is what reaches the
+preserve; the added columns start empty for the same reason. The app creates them at startup too; this script is what reaches the
 installs that upgrade with `git pull` and migrate_all.py before restarting.
 
 This migration is idempotent - safe to run multiple times.
@@ -46,7 +46,13 @@ sys.path.insert(0, PROJECT_ROOT)
 # sqlite3 default of 5s (GitHub issue #1726).
 import _pragmas  # noqa: F401,E402
 
-TABLES = ("broker_keys", "session_revocations", "broker_login_states", "broker_rate_plans")
+TABLES = ("broker_keys", "session_revocations", "broker_login_states")
+
+#: Columns added to a table after it was first created: (table, column).
+ADDED_COLUMNS = (
+    ("session_revocations", "pre_broker_revoked_at"),
+    ("broker_keys", "rate_plan"),
+)
 
 
 def resolve_sqlite_path(db_url):
@@ -107,14 +113,9 @@ def model_tables():
         list: SQLAlchemy Table objects, in TABLES order.
     """
     from database.auth_db import SessionRevocation
-    from database.broker_keys_db import BrokerKey, BrokerLoginState, BrokerRatePlan
+    from database.broker_keys_db import BrokerKey, BrokerLoginState
 
-    return [
-        BrokerKey.__table__,
-        SessionRevocation.__table__,
-        BrokerLoginState.__table__,
-        BrokerRatePlan.__table__,
-    ]
+    return [BrokerKey.__table__, SessionRevocation.__table__, BrokerLoginState.__table__]
 
 
 def missing_tables(engine):
@@ -138,14 +139,15 @@ def missing_columns(engine):
     from sqlalchemy import inspect
 
     inspector = inspect(engine)
-    if "session_revocations" not in inspector.get_table_names():
-        return []
-    present = {column["name"] for column in inspector.get_columns("session_revocations")}
-    return [
-        f"session_revocations.{name}"
-        for name in ("pre_broker_revoked_at",)
-        if name not in present
-    ]
+    tables = set(inspector.get_table_names())
+    missing = []
+    for table, column in ADDED_COLUMNS:
+        if table not in tables:
+            continue
+        present = {c["name"] for c in inspector.get_columns(table)}
+        if column not in present:
+            missing.append(f"{table}.{column}")
+    return missing
 
 
 def main():
@@ -205,11 +207,14 @@ def main():
             print(f"  [FAIL] Could not create: {', '.join(still_missing)}")
             return 1
         from database.auth_db import ensure_session_revocation_columns
+        from database.broker_keys_db import ensure_broker_keys_columns
 
         if not columns:
             print("  [SKIP] All columns already exist")
         for name in ensure_session_revocation_columns(engine):
             print(f"  [OK] Added session_revocations.{name}")
+        for name in ensure_broker_keys_columns(engine):
+            print(f"  [OK] Added broker_keys.{name}")
         still_missing = missing_columns(engine)
         if still_missing:
             print(f"  [FAIL] Could not add: {', '.join(still_missing)}")
