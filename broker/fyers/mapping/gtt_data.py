@@ -50,17 +50,25 @@ def _resolve_single_trigger(data):
     return float(sl) if float(sl) > 0 else float(tg)
 
 
-def _leg(price, trigger_price, quantity):
+# Fyers GTT leg ``type`` (added 18 Nov 2026): 1 = Limit (the default when it
+# is left out, also on modify), 2 = Market. Market is refused for BFO symbols,
+# so gtt_api still turns a BFO MARKET GTT into a protected LIMIT first.
+LEG_TYPE_LIMIT = 1
+LEG_TYPE_MARKET = 2
+
+
+def _leg(price, trigger_price, quantity, market=False):
     """Build one Fyers ``orderInfo`` leg.
 
-    A Fyers GTT leg carries only ``price`` / ``triggerPrice`` / ``qty`` -- there
-    is no per-leg order-type field, which is why the child order is always a
-    LIMIT and MARKET has to be MPP-converted upstream (see gtt_api).
+    A Market leg is sent with ``type: 2`` and price 0, as the GTT Single and
+    GTT OCO pages ask; a Limit leg names its type too, so a modify that turns
+    a Market leg back into a Limit one says so.
     """
     return {
-        "price": float(price or 0),
+        "price": 0.0 if market else float(price or 0),
         "triggerPrice": float(trigger_price or 0),
         "qty": int(float(quantity or 0)),
+        "type": LEG_TYPE_MARKET if market else LEG_TYPE_LIMIT,
     }
 
 
@@ -92,9 +100,10 @@ def build_order_info(data):
     """
     quantity = data["quantity"]
     trigger_type = (data.get("trigger_type") or "").upper()
+    market = (data.get("pricetype") or "").upper() == "MARKET"
 
     if trigger_type != "OCO":
-        return {"leg1": _leg(data.get("price"), _resolve_single_trigger(data), quantity)}
+        return {"leg1": _leg(data.get("price"), _resolve_single_trigger(data), quantity, market)}
 
     tg_trigger = float(data.get("triggerprice_tg") or 0)
     sl_trigger = float(data.get("triggerprice_sl") or 0)
@@ -111,8 +120,8 @@ def build_order_info(data):
         tg_price, sl_price = sl_price, tg_price
 
     return {
-        "leg1": _leg(tg_price, tg_trigger, quantity),  # above LTP
-        "leg2": _leg(sl_price, sl_trigger, quantity),  # below LTP
+        "leg1": _leg(tg_price, tg_trigger, quantity, market),  # above LTP
+        "leg2": _leg(sl_price, sl_trigger, quantity, market),  # below LTP
     }
 
 
@@ -163,16 +172,23 @@ def transform_cancel_gtt(trigger_id):
     return {"id": str(trigger_id)}
 
 
-def _leg_from_book(action, product, price, quantity):
+def _leg_from_book(action, product, price, quantity, ord_type=None):
     return {
         "action": action,
         "quantity": int(float(quantity or 0)),
         "price": float(price or 0),
-        # A Fyers GTT child order is always a limit order (a leg only has
-        # price/triggerPrice/qty), so the normalised pricetype is always LIMIT.
-        "pricetype": "LIMIT",
+        # ord_type / ord_type2 (18 Nov 2026): 2 is Market; 1, or a book from
+        # before the field existed, is Limit.
+        "pricetype": "MARKET" if _as_int(ord_type) == LEG_TYPE_MARKET else "LIMIT",
         "product": product,
     }
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def map_gtt_book(gtt_data):
@@ -213,12 +229,22 @@ def map_gtt_book(gtt_data):
         )
 
         oco_ind = order.get("gtt_oco_ind")
-        legs = [_leg_from_book(action, product, order.get("price_limit"), order.get("qty"))]
+        legs = [
+            _leg_from_book(
+                action, product, order.get("price_limit"), order.get("qty"), order.get("ord_type")
+            )
+        ]
         trigger_prices = [float(order.get("price_trigger") or 0)]
 
         if oco_ind == 2:
             legs.append(
-                _leg_from_book(action, product, order.get("price2_limit"), order.get("qty2"))
+                _leg_from_book(
+                    action,
+                    product,
+                    order.get("price2_limit"),
+                    order.get("qty2"),
+                    order.get("ord_type2"),
+                )
             )
             trigger_prices.append(float(order.get("price2_trigger") or 0))
             # OpenAlgo presents trigger prices low -> high; Fyers stores leg1

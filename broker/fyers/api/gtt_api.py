@@ -167,14 +167,14 @@ def _fetch_last_price(symbol, exchange, auth):
 
 
 def _apply_mpp_if_market(data, auth):
-    """Convert MARKET pricetype -> MPP-protected LIMIT.
+    """Convert a BFO MARKET GTT -> MPP-protected LIMIT.
 
-    A Fyers GTT leg carries only ``price`` / ``triggerPrice`` / ``qty`` -- there
-    is no order-type field anywhere in the GTT request (see the GTT Single and
-    GTT OCO request attributes), so the child order Fyers fires is always a
-    LIMIT at ``price``. MARKET therefore has to be emulated the same way
-    zerodha does it: compute a Market-Price-Protection buffer around the
-    relevant base price, override the limit fields, and force pricetype=LIMIT.
+    Since 18 Nov 2026 a Fyers GTT leg takes ``type: 2`` (Market), so every
+    other exchange sends MARKET as it is (``gtt_data._leg``). Fyers refuses a
+    Market GTT for BFO symbols (code -50), so for BFO MARKET is still emulated
+    the way zerodha does it: compute a Market-Price-Protection buffer around
+    the relevant base price, override the limit fields, and force
+    pricetype=LIMIT.
 
     SINGLE -> buffer applied to the LTP (fetched here, since OpenAlgo clients
               no longer send ``last_price``); ``data["price"]`` overridden.
@@ -184,6 +184,8 @@ def _apply_mpp_if_market(data, auth):
     """
     if (data.get("pricetype") or "").upper() != "MARKET":
         return
+    if (data.get("exchange") or "").upper() != "BFO":
+        return  # sent as a native Market leg
 
     action = (data.get("action") or "").upper()
     symbol = data.get("symbol")
