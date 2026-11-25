@@ -88,7 +88,7 @@ def _request(method, path, auth, payload=None, _retry_count=0):
 
     # GTT create, modify and cancel are order changes: under the gthread
     # worker they wait at most the order bound, then are refused unsent.
-    apply_rate_limit("order")
+    apply_rate_limit("order", path=path)
 
     if method == "GET":
         response = client.request("GET", url, headers=_headers(auth))

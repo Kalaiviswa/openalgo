@@ -56,7 +56,10 @@ _GENERIC_BANNERS = {
     "saved_keys": "Login signs you in with one click using the keys you saved.",
 }
 
-#: broker -> name, sign_in, fields, banner, redirect_hint
+#: broker -> name, sign_in, fields, banner, redirect_hint, and for a broker
+#: whose API limits depend on the trader's plan, rate_plans (id, label, hint),
+#: the default (stricter) plan first. The plan chosen is saved in
+#: database.broker_keys_db and read by the broker's rate limiter.
 GUIDES = {
     "aliceblue": {
         "name": "Alice Blue",
@@ -388,8 +391,24 @@ GUIDES = {
             },
         ),
         "banner": "Login with Fyers takes you to Fyers' login page. Log in there and Fyers "
-        "sends you back to OpenAlgo.",
+        "sends you back to OpenAlgo. Fyers sets its API limits by plan: choose Prime "
+        "below only if your Fyers account has a FYERS Prime subscription.",
         "redirect_hint": "Register this exact address as the redirect URL in your broker app.",
+        "rate_plans": (
+            {
+                "id": "standard",
+                "label": "Standard",
+                "hint": "Market data: 5 requests a second, 50 a minute, 5,000 a day. Orders "
+                "and account: 10 a second, 200 a minute, 100,000 a day.",
+            },
+            {
+                "id": "prime",
+                "label": "Prime",
+                "hint": "Market data: 10 requests a second, 500 a minute, 500,000 a day. "
+                "Orders and account: 10 a second, 500 a minute, 500,000 a day. Choose it "
+                "only if your Fyers API subscription is Prime.",
+            },
+        ),
     },
     "groww": {
         "name": "Groww",
@@ -1103,6 +1122,11 @@ def guide(broker):
         "banner": _GENERIC_BANNERS[sign_in],
         "redirect_hint": REDIRECT_REGISTER if sign_in == "redirect" else "",
     }
+
+
+def rate_plans(broker):
+    """The API plans a broker offers, the default first; empty for most brokers."""
+    return GUIDES.get(broker, {}).get("rate_plans", ())
 
 
 def uses_redirect_url(broker):

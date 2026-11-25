@@ -19,7 +19,9 @@ re-encrypt the whole plaintext, so the binding survives them. Nothing here
 returns a secret to a caller that only needs to show it: the masked view lives
 in the blueprint.
 
-The started broker logins (broker_login_states) sit here too.
+The started broker logins (broker_login_states) sit here too, and the API
+plan the trader chose for a broker that has more than one (broker_rate_plans,
+Fyers Standard or Prime), which decides how fast its requests are paced.
 """
 
 import hashlib
@@ -82,6 +84,21 @@ class BrokerLoginState(Base):
     broker = Column(String(50), nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)
+
+
+class BrokerRatePlan(Base):
+    """The API plan the trader chose for one broker (Fyers: standard or prime).
+
+    Not a secret, so stored in plain text. A broker without a row is paced for
+    its default plan, the first one utils/broker_setup_guide.py lists.
+    """
+
+    __tablename__ = "broker_rate_plans"
+
+    id = Column(Integer, primary_key=True)
+    broker = Column(String(50), unique=True, nullable=False, index=True)
+    plan = Column(String(30), nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 #: How long a started login stays open, and how many may be open at once.
@@ -394,6 +411,51 @@ def clear_login_states():
         if _table_missing(exc):
             return True
         logger.exception("Could not clear the started broker logins")
+        return False
+    finally:
+        db_session.remove()
+
+
+def get_rate_plan(broker):
+    """The API plan saved for a broker, or None when none is saved.
+
+    Args:
+        broker: The broker id, such as "fyers".
+
+    Returns:
+        str | None: The plan id; None also when the table does not exist yet.
+    """
+    try:
+        row = BrokerRatePlan.query.filter_by(broker=broker).first()
+        return row.plan if row else None
+    except Exception as exc:
+        if not _table_missing(exc):
+            logger.exception(f"Could not read the API plan saved for {broker}")
+        return None
+    finally:
+        db_session.remove()
+
+
+def save_rate_plan(broker, plan):
+    """Save the API plan a broker's requests are paced for.
+
+    The caller checks that the broker offers the plan.
+
+    Returns:
+        bool: True when it was saved.
+    """
+    try:
+        row = BrokerRatePlan.query.filter_by(broker=broker).first()
+        if row is None:
+            row = BrokerRatePlan(broker=broker, plan=plan)
+            db_session.add(row)
+        row.plan = plan
+        row.updated_at = datetime.utcnow()
+        db_session.commit()
+        return True
+    except Exception:
+        db_session.rollback()
+        logger.exception(f"Could not save the API plan for {broker}")
         return False
     finally:
         db_session.remove()

@@ -229,6 +229,7 @@ def test_under_gthread_a_near_slot_is_still_just_paced(name, gthread, monkeypatc
     elif name == "dhan":
         monkeypatch.setitem(module._last_api_call_time, "quote", time.time())
     elif name == "fyers":
+        module.reset()  # the far test's booked slot sits in its category too
         monkeypatch.setattr(module, "_last_call_time", time.time())
     elif name == "angel":
         monkeypatch.setitem(module._last_call_ts, "history", time.time())

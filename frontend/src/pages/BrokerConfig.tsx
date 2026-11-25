@@ -104,6 +104,7 @@ export default function BrokerConfig() {
   const [confirmForget, setConfirmForget] = useState(false)
   const [confirmNewKeys, setConfirmNewKeys] = useState(false)
   const [forgetting, setForgetting] = useState(false)
+  const [planSaving, setPlanSaving] = useState(false)
 
   const list = useQuery({
     queryKey: ['broker-list'],
@@ -146,6 +147,25 @@ export default function BrokerConfig() {
   useEffect(() => {
     setRedirectDraft(broker?.redirect_url ?? '')
   }, [selected, broker?.redirect_url])
+
+  // As in OpenAlgo Desktop: the broker's API plan (Fyers Standard or Prime) is
+  // saved on its own, at once; it changes how requests are paced, not the session.
+  const choosePlan = async (id: string, plan: string) => {
+    setPlanSaving(true)
+    setMessage(null)
+    setError(null)
+    try {
+      const text = await brokerConfigApi.setRatePlan(id, plan)
+      if (selectedRef.current === id) setMessage(text)
+      await queryClient.invalidateQueries({ queryKey: ['broker-list'] })
+    } catch (e) {
+      if (selectedRef.current === id) {
+        setError(e instanceof Error ? e.message : 'The API plan was not changed. Try again.')
+      }
+    } finally {
+      setPlanSaving(false)
+    }
+  }
 
   const chooseBroker = (id: string) => {
     setSelected(id)
@@ -378,6 +398,34 @@ export default function BrokerConfig() {
                           </Button>
                         )}
                       </div>
+                    </div>
+                  )}
+
+                  {(broker.rate_plans?.length ?? 0) > 0 && (
+                    <div className="space-y-2">
+                      <Label htmlFor="broker-rate-plan">API plan</Label>
+                      <select
+                        id="broker-rate-plan"
+                        value={broker.rate_plan ?? broker.rate_plans?.[0]?.id ?? ''}
+                        disabled={planSaving}
+                        onChange={(e) => choosePlan(broker.id, e.target.value)}
+                        className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+                      >
+                        {broker.rate_plans?.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </select>
+                      <p className="text-xs text-muted-foreground" data-testid="rate-plan-hint">
+                        {
+                          broker.rate_plans?.find(
+                            (p) => p.id === (broker.rate_plan ?? broker.rate_plans?.[0]?.id)
+                          )?.hint
+                        }{' '}
+                        OpenAlgo paces {broker.name} requests to stay within these limits. It
+                        applies at once and does not sign you out.
+                      </p>
                     </div>
                   )}
 

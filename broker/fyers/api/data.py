@@ -21,9 +21,9 @@ def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
     """
     Make API requests to Fyers API using shared connection pooling.
 
-    Rate limited process-wide (broker.fyers.api.rate_limiter) since Fyers
-    caps all endpoints combined at 10 req/sec per API key -- see
-    fyers-api-docs/FYERS_API_v3.md -> "Rate Limits". On HTTP 429 this retries
+    Rate limited process-wide (broker.fyers.api.rate_limiter), per Fyers API
+    category and for the trader's plan (Standard or Prime, chosen on Broker
+    Configuration). On HTTP 429 this retries
     with backoff (honoring the Retry-After / X-Retry-After-Ms headers when
     present) instead of immediately surfacing the failure to the caller.
 
@@ -46,7 +46,7 @@ def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
         url = f"https://api-t1.fyers.in{endpoint}"
         headers = {"Authorization": f"{api_key}:{AUTH_TOKEN}", "Content-Type": "application/json"}
 
-        apply_rate_limit()
+        apply_rate_limit(path=endpoint)
 
         logger.debug(f"Making {method} request to Fyers API: {url}")
 

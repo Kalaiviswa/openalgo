@@ -17,6 +17,10 @@ Adds three tables to the main database:
 - broker_login_states: broker logins started from the broker login page and
   not yet completed, kept as SHA-256 digests with a ten-minute expiry, so the
   broker's answer is accepted only for a login started here.
+- broker_rate_plans: the API plan the trader chose for a broker that offers
+  more than one (Fyers Standard or Prime), which sets how fast OpenAlgo paces
+  that broker's requests. A broker with no row is paced for its stricter
+  default plan, so an install that upgrades starts with nothing to backfill.
 
 All are new tables, so there is nothing to backfill and no existing value to
 preserve; the added column starts empty for the same reason. The app creates them at startup too; this script is what reaches the
@@ -42,7 +46,7 @@ sys.path.insert(0, PROJECT_ROOT)
 # sqlite3 default of 5s (GitHub issue #1726).
 import _pragmas  # noqa: F401,E402
 
-TABLES = ("broker_keys", "session_revocations", "broker_login_states")
+TABLES = ("broker_keys", "session_revocations", "broker_login_states", "broker_rate_plans")
 
 
 def resolve_sqlite_path(db_url):
@@ -103,9 +107,14 @@ def model_tables():
         list: SQLAlchemy Table objects, in TABLES order.
     """
     from database.auth_db import SessionRevocation
-    from database.broker_keys_db import BrokerKey, BrokerLoginState
+    from database.broker_keys_db import BrokerKey, BrokerLoginState, BrokerRatePlan
 
-    return [BrokerKey.__table__, SessionRevocation.__table__, BrokerLoginState.__table__]
+    return [
+        BrokerKey.__table__,
+        SessionRevocation.__table__,
+        BrokerLoginState.__table__,
+        BrokerRatePlan.__table__,
+    ]
 
 
 def missing_tables(engine):

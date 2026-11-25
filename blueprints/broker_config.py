@@ -112,7 +112,25 @@ def _entry(broker, env_values, env_name, live, saved):
         "redirect_url_is_default": redirect_url == automatic,
         "redirect_hint": hint,
         "source": source if configured else None,
+        **_plan_fields(broker),
     }
+
+
+def _plan_fields(broker):
+    """The broker's API plans and the one its requests are paced for.
+
+    Empty lists and None for a broker with one plan, as OpenAlgo Desktop sends.
+    """
+    from utils.broker_setup_guide import rate_plans
+
+    plans = [dict(p) for p in rate_plans(broker)]
+    if not plans:
+        return {"rate_plans": [], "rate_plan": None}
+    from database.broker_keys_db import get_rate_plan
+
+    saved = get_rate_plan(broker)
+    ids = [p["id"] for p in plans]
+    return {"rate_plans": plans, "rate_plan": saved if saved in ids else ids[0]}
 
 
 @broker_config_bp.route("/list", methods=["GET"])
@@ -353,5 +371,47 @@ def forget_broker(broker):
                 else f"Forgot your {name} keys."
             ),
             "signed_out": signed_out,
+        }
+    )
+
+
+@broker_config_bp.route("/rate-plan/<broker>", methods=["PUT"])
+@check_signed_in
+@limiter.limit(WRITE_RATE_LIMIT)
+def set_rate_plan(broker):
+    """Pace a broker's requests for one of its API plans (json or form: plan).
+
+    Applies at once; the session is not touched, as in OpenAlgo Desktop.
+    """
+    import importlib
+
+    from database.broker_keys_db import save_rate_plan
+    from utils.broker_setup_guide import guide, rate_plans
+
+    broker = _known_broker(broker)
+    if broker is None:
+        return _error("Choose a broker from the list.", 404)
+    name = guide(broker)["name"]
+    data = (request.get_json(silent=True) or {}) if request.is_json else request.form
+    plan = _clean(data.get("plan")) or ""
+    chosen = next((p for p in rate_plans(broker) if p["id"] == plan), None)
+    if chosen is None:
+        return _error(f"{name} has no API plan called {plan or 'that'}.")
+    if not save_rate_plan(broker, chosen["id"]):
+        return _error("The API plan was not changed. Try again.", 500)
+    # The broker's limiter re-reads the plan on its own within half a minute;
+    # in this process it can start now.
+    try:
+        limiter_module = importlib.import_module(f"broker.{broker}.api.rate_limiter")
+        forget = getattr(limiter_module, "forget_plan", None)
+        if forget:
+            forget()
+    except ImportError:
+        pass
+    logger.info(f"{broker} requests are now paced for the {chosen['label']} plan")
+    return _ok(
+        {
+            "message": f"{name} requests are now paced for the {chosen['label']} plan.",
+            "rate_plan": chosen["id"],
         }
     )

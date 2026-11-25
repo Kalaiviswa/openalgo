@@ -35,6 +35,17 @@ export interface BrokerKeyField {
   saved: string | null
 }
 
+/**
+ * One of a broker's API plans (Fyers: Standard, the default, or Prime).
+ * OpenAlgo paces the broker's requests for the chosen one.
+ */
+export interface RatePlanOption {
+  id: string
+  label: string
+  /** The limits the plan allows, for the trader. */
+  hint: string
+}
+
 /** One broker as the Select Broker and Broker Configuration pages show it. */
 export interface BrokerEntry {
   id: string
@@ -58,6 +69,10 @@ export interface BrokerEntry {
   redirect_hint: string | null
   /** Where the keys live: the .env file, OpenAlgo, or nowhere yet. */
   source?: 'env' | 'saved' | null
+  /** The broker's API plans, the default first; empty for most brokers. */
+  rate_plans?: RatePlanOption[]
+  /** The plan requests are paced for now (brokers with plans only). */
+  rate_plan?: string | null
 }
 
 export interface BrokerList {
@@ -157,6 +172,19 @@ export const brokerConfigApi = {
    * Remove a broker's saved keys. Forgetting the broker that is logged in
    * signs out of it first, and only with `signOut` (the page confirms).
    */
+  /**
+   * Pace the broker's requests for one of its API plans. Applies at once;
+   * the session is not touched. Returns the server's sentence.
+   */
+  async setRatePlan(id: string, plan: string): Promise<string> {
+    const body = await write<{ message?: string }>(
+      `/api/broker/rate-plan/${encodeURIComponent(id)}`,
+      'PUT',
+      { plan }
+    )
+    return body.message ?? 'Saved.'
+  },
+
   async forget(id: string, signOut: boolean): Promise<string> {
     const body = await write<{ message?: string }>(
       `${brokerPath(id)}${signOut ? '?sign_out=true' : ''}`,

@@ -1272,7 +1272,7 @@ def test_the_migration_adds_its_tables_once(tmp_path):
 
     status = _migrate(db_file, "--status")
     assert status.returncode == 0, status.stdout + status.stderr
-    assert "Would create 3 table(s) and add 0 column(s)." in status.stdout
+    assert "Would create 4 table(s) and add 0 column(s)." in status.stdout
 
     first = _migrate(db_file)
     again = _migrate(db_file)
@@ -1285,6 +1285,7 @@ def test_the_migration_adds_its_tables_once(tmp_path):
         "broker_keys",
         "session_revocations",
         "broker_login_states",
+        "broker_rate_plans",
         "ix_broker_keys_broker",
     } <= names
 
@@ -1313,9 +1314,12 @@ def test_the_migration_adds_only_what_is_missing(tmp_path):
     status = _migrate(db_file, "--status")
     applied = _migrate(db_file)
 
-    assert "Would create 2 table(s) and add 0 column(s)." in status.stdout
+    assert "Would create 3 table(s) and add 0 column(s)." in status.stdout
     assert "broker_keys            present" in status.stdout
     assert "[OK] Created session_revocations" in applied.stdout
+    # The API plan table (Fyers Standard or Prime) reaches an install that
+    # already had the broker keys tables.
+    assert "[OK] Created broker_rate_plans" in applied.stdout
     assert "Created broker_keys" not in applied.stdout
     with closing(sqlite3.connect(db_file)) as conn:
         assert conn.execute("SELECT broker, api_key FROM broker_keys").fetchall() == [
@@ -3827,3 +3831,56 @@ def test_only_a_browser_on_a_broker_is_held_to_it(stores):
         before_broker_login = auth_db.get_auth_token(USER)
 
     assert outside == api_request == before_broker_login == "tok"
+
+
+# --------------------------------------------------------------------------
+# The API plan a broker's requests are paced for (Fyers Standard or Prime)
+# --------------------------------------------------------------------------
+
+
+def test_fyers_offers_standard_then_prime_and_starts_on_standard(stores, environment):
+    _, brokers = _listed(_signed_in(_app()))
+
+    fyers = brokers["fyers"]
+    assert [p["id"] for p in fyers["rate_plans"]] == ["standard", "prime"]
+    assert fyers["rate_plan"] == "standard"
+    assert "50 a minute" in fyers["rate_plans"][0]["hint"]
+    # A broker with one plan sends none, as OpenAlgo Desktop does.
+    assert brokers["zerodha"]["rate_plans"] == [] and brokers["zerodha"]["rate_plan"] is None
+
+
+def test_choosing_prime_is_saved_and_applies_without_ending_the_session(
+    stores, environment, monkeypatch
+):
+    import broker.fyers.api.rate_limiter as fyers_limiter
+
+    _save_fyers()
+    _logged_in("fyers")
+    client = _signed_in(_app())
+    fyers_limiter.forget_plan()
+    assert fyers_limiter.current_plan() == "standard"
+
+    response = client.put("/api/broker/rate-plan/fyers", json={"plan": "prime"})
+
+    assert response.status_code == 200
+    assert response.get_json()["message"] == "Fyers requests are now paced for the Prime plan."
+    assert keys_db.get_rate_plan("fyers") == "prime"
+    # The limiter in this process reads the new plan on its next call.
+    assert fyers_limiter.current_plan() == "prime"
+    _, brokers = _listed(client)
+    assert brokers["fyers"]["rate_plan"] == "prime" and brokers["fyers"]["active"]
+    fyers_limiter.forget_plan()
+
+
+def test_a_plan_the_broker_does_not_offer_is_refused(stores, environment):
+    client = _signed_in(_app())
+
+    bad = client.put("/api/broker/rate-plan/fyers", json={"plan": "gold"})
+    none = client.put("/api/broker/rate-plan/zerodha", json={"plan": "prime"})
+
+    assert bad.status_code == 400 and none.status_code == 400
+    assert bad.get_json()["message"] == "Fyers has no API plan called gold."
+    assert keys_db.get_rate_plan("fyers") is None and keys_db.get_rate_plan("zerodha") is None
+    assert _app().test_client().put(
+        "/api/broker/rate-plan/fyers", json={"plan": "prime"}, headers=JSON
+    ).status_code == 401
