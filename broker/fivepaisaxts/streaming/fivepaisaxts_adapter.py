@@ -7,6 +7,7 @@ import time
 from collections import deque
 from typing import Any, Dict, List, Optional
 
+from broker.fivepaisaxts.streaming.fivepaisaxts_binary import xts_to_unix
 from broker.fivepaisaxts.streaming.fivepaisaxts_websocket import FivepaisaXTSWebSocketClient
 from database.auth_db import get_auth_token, get_feed_token
 from database.token_db import get_token
@@ -707,8 +708,16 @@ class FivepaisaXTSWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     if (item[0], self._instrument_key(item[1])) != target
                 )
 
+            # LTP and Quote share 1501 (#2493): while the other mode still
+            # holds this instrument, the server-side subscription stays.
+            shared = self._code_still_held(mode, instruments[0])
+
+        if shared:
+            self.logger.info(
+                f"Keeping the XTS subscription for {symbol}.{exchange}: another mode still uses it"
+            )
         # Unsubscribe if connected
-        if self.connected and self.ws_client:
+        elif self.connected and self.ws_client:
             try:
                 self.logger.info(
                     f"Sending unsubscribe request for {symbol}.{exchange} to XTS server"
@@ -912,65 +921,66 @@ class FivepaisaXTSWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 f"Found symbol: {symbol} for token {exchange_instrument_id} on exchange {exchange}"
             )
 
-            # Determine mode based on MessageCode
-            message_code = data.get("MessageCode")
-            if message_code == 1512:  # LTP
-                mode = 1
-                mode_str = "LTP"
-            elif message_code == 1501:  # Quote
-                mode = 2
-                mode_str = "QUOTE"
-            elif message_code == 1502:  # Depth
-                mode = 3
-                mode_str = "DEPTH"
-            else:
-                self.logger.warning(f"Unknown MessageCode: {message_code}")
+            modes = self._modes_for_message(data.get("MessageCode"), symbol, exchange)
+            if not modes:
+                self.logger.warning(f"Unknown MessageCode: {data.get('MessageCode')}")
                 return
 
-            self.logger.info(f"Determined mode {mode} ({mode_str}) from MessageCode {message_code}")
+            for mode in modes:
+                mode_str = self._MODE_NAMES[mode]
+                # Use standard topic format without broker prefix for WebSocket proxy routing
+                topic = f"{exchange}_{symbol}_{mode_str}"
 
-            # Check if we have an active subscription for this symbol and mode (optional check)
-            check_correlation_id = f"{symbol}_{exchange}_{mode}"
-            if check_correlation_id not in self.subscriptions:
-                self.logger.warning(
-                    f"No active subscription found for {check_correlation_id}, but publishing anyway"
+                market_data = self._normalize_market_data(data, mode)
+                market_data.update(
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "mode": mode,
+                        "timestamp": int(time.time() * 1000),
+                    }
                 )
-                # We'll publish the data anyway since we received it
 
-            # Create topic for ZeroMQ
-            # Use standard topic format without broker prefix for WebSocket proxy routing
-            topic = f"{exchange}_{symbol}_{mode_str}"
-
-            # Normalize the data
-            market_data = self._normalize_market_data(data, mode)
-
-            # Add metadata
-            market_data.update(
-                {
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "mode": mode,
-                    "timestamp": int(time.time() * 1000),
-                }
-            )
-
-            self.logger.info(f"Publishing market data: {market_data}")
-            self.logger.info(f"Publishing to topic: {topic} on ZMQ port: {self.zmq_port}")
-
-            # Log the socket state before publishing
-            self.logger.info(
-                f"ZMQ Socket State - Port: {getattr(self, 'zmq_port', 'Unknown')}, Connected: {getattr(self, 'connected', False)}"
-            )
-            self.logger.info(f"Environment ZMQ_PORT: {os.environ.get('ZMQ_PORT', 'Not Set')}")
-
-            # Publish to ZeroMQ
-            self.publish_market_data(topic, market_data)
-            self.logger.info(
-                f"Published data successfully to ZMQ - Topic: {topic}, Data: {market_data}"
-            )
+                self.logger.debug(f"Publishing to topic {topic}: {market_data}")
+                self.publish_market_data(topic, market_data)
 
         except Exception as e:
             self.logger.error(f"Error processing JSON data: {e}", exc_info=True)
+
+    _MODE_NAMES = {1: "LTP", 2: "QUOTE", 3: "DEPTH"}
+
+    def _code_still_held(self, mode: int, instrument: dict) -> bool:
+        """Whether another stored subscription needs the same XTS code for
+        this instrument. The caller holds self.lock."""
+        codes = FivepaisaXTSWebSocketClient.MODE_TO_XTS_CODE
+        code = codes.get(mode)
+        key = self._instrument_key(instrument)
+        return any(
+            codes.get(sub["mode"]) == code
+            and any(self._instrument_key(i) == key for i in sub["instruments"])
+            for sub in self.subscriptions.values()
+        )
+
+    def _modes_for_message(self, message_code, symbol: str, exchange: str) -> list[int]:
+        """The modes a message is published to.
+
+        1501 serves both LTP and Quote, since LTP subscribes to 1501 (#2493):
+        it goes to each of the two the symbol is subscribed in, or to Quote
+        when neither is on record. 1502 is depth, 1512 LTP.
+        """
+        if message_code == 1501:
+            with self.lock:
+                held = [
+                    mode
+                    for mode in (1, 2)
+                    if f"{symbol}_{exchange}_{mode}" in self.subscriptions
+                ]
+            return held or [2]
+        if message_code == 1502:
+            return [3]
+        if message_code == 1512:
+            return [1]
+        return []
 
     def _normalize_market_data(self, message: dict[str, Any], mode: int) -> dict[str, Any]:
         """
@@ -985,10 +995,12 @@ class FivepaisaXTSWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """
         # XTS nests the touchline fields under "Touchline" in 1502 and, on
         # many servers, in 1501 too; read them there whenever it is present.
+        # LastTradedTime is XTS time (seconds from 1980-01-01 IST); passed on
+        # as sent, it put every tick in a 2016 candle (#2493).
         if isinstance(message.get("Touchline"), dict):
             touchline = message.get("Touchline", {})
             ltp = touchline.get("LastTradedPrice", 0)
-            ltt = touchline.get("LastTradedTime", 0)
+            ltt = xts_to_unix(touchline.get("LastTradedTime", 0))
             volume = touchline.get("TotalTradedQuantity", 0)
             open_price = touchline.get("Open", 0)
             high = touchline.get("High", 0)
@@ -1007,7 +1019,7 @@ class FivepaisaXTSWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Otherwise (1512, and 1501 on servers that send it flat) the
             # fields are at root level
             ltp = message.get("LastTradedPrice", 0)
-            ltt = message.get("LastTradedTime", 0)
+            ltt = xts_to_unix(message.get("LastTradedTime", 0))
             volume = message.get("TotalTradedQuantity", 0)
             open_price = message.get("Open", 0)
             high = message.get("High", 0)

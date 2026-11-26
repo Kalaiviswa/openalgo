@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional
 import requests
 import socketio
 
-from broker.fivepaisaxts.baseurl import BASE_URL, INTERACTIVE_URL, MARKET_DATA_URL
+from broker.fivepaisaxts.baseurl import BASE_URL, FEED_MARKET_DATA_URL, MARKET_DATA_URL
+from broker.fivepaisaxts.streaming.fivepaisaxts_binary import decode_packet
 from utils.logging import get_logger
 
 
@@ -24,10 +25,14 @@ class FivepaisaXTSWebSocketClient:
 
     # Socket.IO endpoints - Updated based on XTS API documentation
 
-    SOCKET_PATH = "/apimarketdata/socket.io"
-    API_BASE_URL = f"{MARKET_DATA_URL}/instruments/subscription"
+    # Ticks are streamed on /feedmarketdata (issue #2493): /apimarketdata's
+    # socket accepts subscriptions but carries no 1501/1502 events, while
+    # 5paisa's own XTS web app streams from /feedmarketdata. Both take the same
+    # market data session, so the feed still shares history's token (#2484).
+    SOCKET_PATH = "/feedmarketdata/socket.io"
+    API_BASE_URL = f"{FEED_MARKET_DATA_URL}/instruments/subscription"
     API_UNSUBSCRIBE_URL = (
-        f"{MARKET_DATA_URL}/instruments/subscription"  # Same endpoint, different method
+        f"{FEED_MARKET_DATA_URL}/instruments/subscription"  # Same endpoint, different method
     )
 
     # Available Actions
@@ -48,8 +53,13 @@ class FivepaisaXTSWebSocketClient:
     # entry and silently fall back to 1501, which unsubscribed the wrong feed
     # for LTP and depth as soon as subscriptions were batched under ids of
     # their own.
+    #
+    # LTP subscribes to 1501 too: /feedmarketdata sends no 1512 frames, so LTP
+    # is read from the touchline (#2493). The adapter publishes a 1501 tick to
+    # both LTP and Quote subscribers, and unsubscribes 1501 only when neither
+    # mode still wants the instrument.
     MODE_TO_XTS_CODE = {
-        1: 1512,  # LTP
+        1: 1501,  # LTP, from the touchline
         2: 1501,  # Quote
         3: 1502,  # Market depth
     }
@@ -177,6 +187,8 @@ class FivepaisaXTSWebSocketClient:
             # 1105 events (binary market data)
             ("1105-json-partial", self._on_message_1105_json_partial),
             ("1105-json-full", self._on_message_1105_json_full),
+            # /feedmarketdata's ticks: compressed binary frames (#2493)
+            ("xts-binary-packet", self._on_xts_binary_packet),
         ):
             self.sio.on(event, self._stamped(handler))
 
@@ -803,6 +815,33 @@ class FivepaisaXTSWebSocketClient:
         self.logger.info(f"[1512-JSON-PARTIAL] Received Full data partial: {data}")
         if self.on_data:
             self.on_data(self, data)
+
+    def _on_xts_binary_packet(self, data):
+        """Decode an `xts-binary-packet` and pass on each subscribed frame.
+
+        One packet can carry frames for several instruments. Each decoded
+        frame has the shape of the matching JSON event, so it goes through the
+        same on_data path. Frames for instruments not in the book are dropped,
+        as 1105 ticks are.
+        """
+        try:
+            messages = decode_packet(data)
+        except Exception as e:
+            self.logger.error(f"[XTS-BINARY] Could not decode packet: {e}")
+            return
+        if not messages or not self.on_data:
+            return
+        wanted = {
+            self._instrument_key(instrument)
+            for sub in list(self.subscriptions.values())
+            for instrument in sub.get("instruments", [])
+        }
+        for message in messages:
+            key = (str(message["ExchangeSegment"]), str(message["ExchangeInstrumentID"]))
+            if key not in wanted:
+                continue
+            self.logger.debug(f"[XTS-BINARY] {message['MessageCode']} for {key}")
+            self.on_data(self, message)
 
     def _on_message_1105_json_full(self, data):
         """Handle 1105 JSON full messages (Binary market data)"""

@@ -9,6 +9,7 @@ import pytz
 from broker.fivepaisaxts.api.auth_api import get_feed_token as refresh_feed_token
 from broker.fivepaisaxts.baseurl import MARKET_DATA_URL
 from broker.fivepaisaxts.database.master_contract_db import SymToken, db_session
+from broker.fivepaisaxts.streaming.fivepaisaxts_binary import xts_to_unix
 from database.auth_db import get_feed_token
 from database.token_db import get_br_symbol, get_brexchange, get_oa_symbol
 from utils.httpx_client import get_httpx_client
@@ -18,6 +19,13 @@ logger = get_logger(__name__)
 
 # Configure logging
 logger = get_logger(__name__)
+
+_CANDLE_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+_IST = pytz.timezone("Asia/Kolkata")
+
+
+def _ist_today():
+    return datetime.now(_IST).date()
 
 
 def get_api_response(endpoint, auth, method="GET", payload="", feed_token=None, params=None):
@@ -113,6 +121,82 @@ class BrokerData:
         except Exception as e:
             logger.error(f"Error refreshing feed token: {e}")
             return False
+
+    def _today_daily_candle(self, exchange: str, token) -> tuple[dict, int]:
+        """Today's daily candle from the quote, and its last trade (Unix seconds).
+
+        The timestamp is 00:00 UTC of today's IST date, as the daily history
+        candles are. Raises when the quote cannot be read.
+        """
+        exchange_segment_map = {
+            "NSE": 1,
+            "NSE_INDEX": 1,
+            "BSE_INDEX": 11,
+            "NFO": 2,
+            "CDS": 3,
+            "BSE": 11,
+            "BFO": 12,
+            "MCX": 51,
+        }
+        segment_id = exchange_segment_map.get(exchange)
+        if segment_id is None:
+            raise ValueError(f"Unknown exchange: {exchange}")
+        payload = {
+            "instruments": [{"exchangeSegment": segment_id, "exchangeInstrumentID": token}],
+            "xtsMessageCode": 1502,
+            "publishFormat": "JSON",
+        }
+
+        response = get_api_response(
+            "/instruments/quotes",
+            self.auth_token,
+            method="POST",
+            payload=payload,
+            feed_token=self.feed_token,
+        )
+        if not response or response.get("type") != "success":
+            raise Exception(
+                f"Error from FivepaisaXTS API: {(response or {}).get('description', 'Unknown error')}"
+            )
+
+        raw_quotes = response.get("result", {}).get("listQuotes", [])
+        if not raw_quotes:
+            raise Exception("No quote data found in listQuotes")
+        touchline = json.loads(raw_quotes[0]).get("Touchline", {})
+        logger.debug(f"Parsed Quote Data: {touchline}")
+        if not touchline:
+            raise Exception("No Touchline data in quote")
+
+        today = _ist_today()
+        candle = {
+            "timestamp": int(datetime(today.year, today.month, today.day, tzinfo=pytz.utc).timestamp()),
+            "open": touchline.get("Open"),
+            "high": touchline.get("High"),
+            "low": touchline.get("Low"),
+            "close": touchline.get("LastTradedPrice"),  # Use LTP as current close
+            "volume": touchline.get("TotalTradedQuantity", 0),
+        }
+        return candle, xts_to_unix(touchline.get("LastTradedTime", 0))
+
+    def _with_today_daily_candle(self, df: pd.DataFrame, exchange: str, token) -> pd.DataFrame:
+        """Append today's candle to daily history that ends before today.
+
+        Only when the quote's last trade is from today: before the open, or on
+        a holiday, the quote still shows the previous session. A quote that
+        cannot be read leaves the history as it is.
+        """
+        today = _ist_today()
+        last = pd.to_datetime(df["timestamp"].max(), unit="s").date()
+        if last >= today:
+            return df
+        try:
+            candle, last_trade = self._today_daily_candle(exchange, token)
+        except Exception as e:
+            logger.warning(f"Could not add today's daily candle: {e}")
+            return df
+        if not last_trade or datetime.fromtimestamp(last_trade, _IST).date() != today:
+            return df
+        return pd.concat([df, pd.DataFrame([candle], columns=_CANDLE_COLUMNS)], ignore_index=True)
 
     def _get_instrument_token(self, symbol: str, exchange: str) -> tuple:
         """
@@ -657,81 +741,12 @@ class BrokerData:
 
                 current_start = current_end + timedelta(seconds=1)
 
+            runs_to_today = compression_value == "D" and to_date.date() == _ist_today()
+
             if not dfs:
-                if compression_value == "D" and to_date.date() == datetime.now().date():
-                    # Get segment ID from exchange - use numeric values
-                    # segment_id = 1 if exchange == "NSE" else 2  # 1 for NSECM, 2 for BSECM
-                    # Exchange segment mapping
-                    exchange_segment_map = {
-                        "NSE": 1,
-                        "NSE_INDEX": 1,
-                        "BSE_INDEX": 11,
-                        "NFO": 2,
-                        "CDS": 3,
-                        "BSE": 11,
-                        "BFO": 12,
-                        "MCX": 51,
-                    }
-
-                    # Determine segment ID based on exchange
-                    segment_id = exchange_segment_map.get(exchange)
-                    logger.debug(f"Exchange: {{exchange}}, Segment ID: {segment_id}")
-                    if segment_id is None:
-                        raise ValueError(f"Unknown exchange: {exchange}")
-                    payload = {
-                        "instruments": [
-                            {"exchangeSegment": segment_id, "exchangeInstrumentID": token}
-                        ],
-                        "xtsMessageCode": 1502,
-                        "publishFormat": "JSON",
-                    }
-
-                    response = get_api_response(
-                        "/instruments/quotes",
-                        self.auth_token,
-                        method="POST",
-                        payload=payload,
-                        feed_token=self.feed_token,
-                    )
-
-                    if not response or response.get("type") != "success":
-                        raise Exception(
-                            f"Error from FivepaisaXTS API: {response.get('description', 'Unknown error')}"
-                        )
-
-                    # Parse quote data from response
-                    raw_quotes = response.get("result", {}).get("listQuotes", [])
-                    if not raw_quotes:
-                        raise Exception("No quote data found in listQuotes")
-
-                    # Parse the JSON string in listQuotes
-                    quote = json.loads(raw_quotes[0])
-                    touchline = quote.get("Touchline", {})
-                    logger.debug(f"Parsed Quote Data: {touchline}")
-
-                    if touchline:
-                        # For daily data, set timestamp to midnight IST
-                        today = datetime.now()
-                        # First set to midnight
-                        today = today.replace(hour=0, minute=0, second=0, microsecond=0)
-                        # Add 5:30 hours to compensate for IST conversion that happens later
-                        today = today + timedelta(hours=5, minutes=30)
-
-                        today_candle = {
-                            "timestamp": int(today.timestamp()),
-                            "open": touchline.get("Open"),
-                            "high": touchline.get("High"),
-                            "low": touchline.get("Low"),
-                            "close": touchline.get("LastTradedPrice"),  # Use LTP as current close
-                            "volume": touchline.get("TotalTradedQuantity", 0),
-                        }
-
-                        return pd.DataFrame(
-                            [today_candle],
-                            columns=["timestamp", "open", "high", "low", "close", "volume"],
-                        )
-                    else:
-                        raise Exception("No Touchline data in quote")
+                if runs_to_today:
+                    today_candle, _ = self._today_daily_candle(exchange, token)
+                    return pd.DataFrame([today_candle], columns=_CANDLE_COLUMNS)
             final_df = pd.concat(dfs, ignore_index=True)
 
             # Sort by timestamp and remove duplicates
@@ -760,6 +775,12 @@ class BrokerData:
 
             # Convert back to Unix timestamp
             final_df["timestamp"] = final_df["timestamp"].astype("int64") // 10**9
+
+            # XTS daily history holds finished days only, so during a session a
+            # daily chart ended at the previous day (#2493). Add today's candle
+            # from the quote, once the quote shows a trade today.
+            if runs_to_today:
+                final_df = self._with_today_daily_candle(final_df, exchange, token)
 
             # Ensure numeric columns are properly typed
             numeric_columns = ["open", "high", "low", "close", "volume"]

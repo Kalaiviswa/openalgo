@@ -401,7 +401,7 @@ def test_feed_connects_with_the_stored_token_and_never_logs_in(monkeypatch):
 
     [url] = client.sio.urls
     assert f"token={token}" in url and "userID=1048131&" in url
-    assert client.sio.paths == ["/apimarketdata/socket.io"]
+    assert client.sio.paths == ["/feedmarketdata/socket.io"]  # ticks come there (#2493)
     assert client.market_data_token == token
 
 
